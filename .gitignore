@@ -126,3 +126,13 @@ results/
 benchmark_results/*
 !benchmark_results/.gitkeep
 scripts/**/__pycache__/
+
+# Maintainer-local verification artifacts and benchmark corpora
+.harbor-datasets/
+.pinchbench-skill/
+.terminal-bench-datasets/
+.uv-bin/
+codewhale__*.json
+issues/
+logs/
+notes/

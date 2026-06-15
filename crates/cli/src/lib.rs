@@ -215,6 +215,23 @@ working-tree diff. `export` only writes the current diff.
     /// Inspect TUI feature flags.
     Features(TuiPassthroughArgs),
     /// Run a local TUI server.
+    #[command(after_help = "\
+Forwarded serve options:
+      --mcp                 Start MCP server over stdio
+      --http                Start runtime HTTP/SSE API server
+      --mobile              Start runtime HTTP/SSE API server with the mobile control page
+      --qr                  Show a QR code for the mobile URL (requires --mobile)
+      --acp                 Start ACP server over stdio for editor clients
+      --host <HOST>         Bind host (default 127.0.0.1; --mobile defaults to 0.0.0.0)
+      --port <PORT>         Bind port [default: 7878]
+      --workers <WORKERS>   Background task worker count (1-8)
+      --cors-origin <URL>   Additional CORS origin to allow (repeatable)
+      --auth-token <TOKEN>  Require this bearer token for /v1/* runtime API routes
+      --insecure            Disable runtime API auth when no token is configured
+
+`codewhale serve --http` and `codewhale serve --mobile` remain compatibility
+aliases for `codewhale app-server --http` and `codewhale app-server --mobile`.
+New integrations should prefer `codewhale app-server`.")]
     Serve(TuiPassthroughArgs),
     /// Generate shell completions for the TUI binary.
     Completions(TuiPassthroughArgs),
@@ -2705,6 +2722,18 @@ mod tests {
         // No host/port forwarded → serve applies its own --mobile 0.0.0.0 default.
         // No auth token is injected from the environment into child argv.
         assert_eq!(as_str, vec!["serve", "--mobile", "--qr"]);
+    }
+
+    #[test]
+    fn serve_help_documents_forwarded_runtime_modes() {
+        let help = help_for(&["codewhale", "serve", "--help"]);
+        for flag in ["--http", "--mobile", "--mcp", "--acp"] {
+            assert!(
+                help.contains(flag),
+                "serve help should document forwarded flag {flag}; help was:\n{help}"
+            );
+        }
+        assert!(help.contains("compatibility"));
     }
 
     #[test]

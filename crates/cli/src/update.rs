@@ -684,16 +684,15 @@ fn release_tag_from_github_release_html(body: &str) -> Option<String> {
         "/releases/tag/",
     ];
     for marker in MARKERS {
-        let Some((_, rest)) = body.split_once(marker) else {
-            continue;
-        };
-        let tag = rest
-            .split(|ch: char| matches!(ch, '"' | '\'' | '<' | '>' | '?' | '#' | '&'))
-            .next()
-            .unwrap_or("")
-            .trim();
-        if !tag.is_empty() {
-            return Some(tag.to_string());
+        for rest in body.split(marker).skip(1) {
+            let tag = rest
+                .split(['"', '\'', '<', '>', '?', '#', '&'])
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !tag.is_empty() {
+                return Some(tag.to_string());
+            }
         }
     }
     None
@@ -1538,6 +1537,19 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             "got {request:?}"
         );
         handle.join().expect("test server thread");
+    }
+
+    #[test]
+    fn github_release_html_parser_skips_empty_first_marker() {
+        let body = r#"
+            <a href="/Hmbown/CodeWhale/releases/tag/?expanded=true">generic</a>
+            <a href="/Hmbown/CodeWhale/releases/tag/v9.9.9">latest</a>
+        "#;
+
+        assert_eq!(
+            release_tag_from_github_release_html(body).as_deref(),
+            Some("v9.9.9")
+        );
     }
 
     #[test]
