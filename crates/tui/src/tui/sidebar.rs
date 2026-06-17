@@ -211,6 +211,8 @@ pub(crate) struct SidebarWorkSummary {
     strategy_explanation: Option<String>,
     strategy_steps: Vec<SidebarWorkStrategyStep>,
     state_updating: bool,
+    pause_indicator: Option<String>,
+    workflow_paused: bool,
 }
 
 impl SidebarWorkSummary {
@@ -297,6 +299,37 @@ fn has_renderable_strategy(summary: &SidebarWorkSummary) -> bool {
 }
 
 fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
+    fn live_goal_objective(app: &App) -> Option<String> {
+        if app.paused || app.paused_quarry.is_some() {
+            app.hunt
+                .quarry
+                .clone()
+                .or_else(|| app.paused_quarry.clone())
+        } else {
+            app.hunt.quarry.clone()
+        }
+    }
+
+    fn live_pause_indicator(app: &App) -> Option<String> {
+        if app.paused && app.is_loading {
+            Some("(Pausing)".to_string())
+        } else if app.paused || app.paused_quarry.is_some() {
+            Some("(Paused)".to_string())
+        } else {
+            None
+        }
+    }
+
+    fn apply_live_goal_state(summary: &mut SidebarWorkSummary, app: &App) {
+        summary.goal_objective = live_goal_objective(app);
+        summary.goal_token_budget = app.hunt.token_budget;
+        summary.goal_completed = app.hunt.verdict == HuntVerdict::Hunted;
+        summary.goal_started_at = app.hunt.started_at;
+        summary.tokens_used = app.session.total_conversation_tokens;
+        summary.pause_indicator = live_pause_indicator(app);
+        summary.workflow_paused = app.paused || app.paused_quarry.is_some();
+    }
+
     let fresh = (|| {
         let todos = app.todos.try_lock().ok()?;
         let plan = app.plan_state.try_lock().ok()?;
@@ -329,8 +362,8 @@ fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
             )
         };
 
-        Some(SidebarWorkSummary {
-            goal_objective: app.hunt.quarry.clone(),
+        let mut summary = SidebarWorkSummary {
+            goal_objective: live_goal_objective(app),
             goal_token_budget: app.hunt.token_budget,
             goal_completed: app.hunt.verdict == HuntVerdict::Hunted,
             goal_started_at: app.hunt.started_at,
@@ -340,7 +373,11 @@ fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
             strategy_explanation,
             strategy_steps,
             state_updating: false,
-        })
+            pause_indicator: live_pause_indicator(app),
+            workflow_paused: app.paused || app.paused_quarry.is_some(),
+        };
+        apply_live_goal_state(&mut summary, app);
+        Some(summary)
     })();
 
     if let Some(summary) = fresh {
@@ -350,23 +387,16 @@ fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
 
     if let Some(cached) = app.cached_work_summary.as_ref() {
         let mut summary = cached.clone();
-        summary.goal_objective = app.hunt.quarry.clone();
-        summary.goal_token_budget = app.hunt.token_budget;
-        summary.goal_completed = app.hunt.verdict == HuntVerdict::Hunted;
-        summary.goal_started_at = app.hunt.started_at;
-        summary.tokens_used = app.session.total_conversation_tokens;
+        apply_live_goal_state(&mut summary, app);
         return summary;
     }
 
-    SidebarWorkSummary {
-        goal_objective: app.hunt.quarry.clone(),
-        goal_token_budget: app.hunt.token_budget,
-        goal_completed: app.hunt.verdict == HuntVerdict::Hunted,
-        goal_started_at: app.hunt.started_at,
-        tokens_used: app.session.total_conversation_tokens,
+    let mut summary = SidebarWorkSummary {
         state_updating: true,
         ..SidebarWorkSummary::default()
-    }
+    };
+    apply_live_goal_state(&mut summary, app);
+    summary
 }
 
 fn work_panel_lines(
@@ -412,7 +442,13 @@ fn work_panel_hover_texts(
         && !objective.trim().is_empty()
         && texts.len() < max_rows
     {
-        let icon = if summary.goal_completed { "✓" } else { "◆" };
+        let icon = if summary.goal_completed {
+            "✓"
+        } else if summary.workflow_paused {
+            "⏸"
+        } else {
+            "◆"
+        };
         texts.push(format!("{icon} {objective}"));
 
         if let Some(started) = summary.goal_started_at
@@ -591,7 +627,13 @@ fn push_work_goal_lines(
         return;
     }
 
-    let icon = if summary.goal_completed { "✓" } else { "◆" };
+    let icon = if summary.goal_completed {
+        "✓"
+    } else if summary.workflow_paused {
+        "⏸"
+    } else {
+        "◆"
+    };
     let status_style = if summary.goal_completed {
         Style::default()
             .fg(theme.success)
@@ -601,12 +643,17 @@ fn push_work_goal_lines(
             .fg(theme.warning)
             .add_modifier(ratatui::style::Modifier::BOLD)
     };
+    let label = if let Some(indicator) = summary.pause_indicator.as_deref() {
+        format!("{objective} {indicator}")
+    } else {
+        objective.to_string()
+    };
 
     lines.push(Line::from(Span::styled(
         format!(
             "{} {}",
             icon,
-            truncate_line_to_width(objective, content_width.saturating_sub(2).max(1))
+            truncate_line_to_width(&label, content_width.saturating_sub(2).max(1))
         ),
         status_style,
     )));
@@ -3423,6 +3470,54 @@ mod tests {
 
         assert_eq!(summary.goal_objective.as_deref(), Some("updated quarry"));
         assert!(!summary.goal_completed, "verdict should be live");
+    }
+
+    #[test]
+    fn sidebar_work_summary_uses_paused_quarry_when_goal_is_cleared() {
+        let mut app = create_test_app();
+        app.hunt.quarry = None;
+        app.paused = true;
+        app.paused_quarry = Some("Scan nested git repositories".to_string());
+
+        let summary = sidebar_work_summary(&mut app);
+
+        assert_eq!(
+            summary.goal_objective.as_deref(),
+            Some("Scan nested git repositories")
+        );
+        assert_eq!(summary.pause_indicator.as_deref(), Some("(Paused)"));
+        assert!(summary.workflow_paused);
+    }
+
+    #[test]
+    fn work_panel_renders_paused_command_goal() {
+        let mut app = create_test_app();
+        app.hunt.quarry = None;
+        app.paused = false;
+        app.paused_quarry = Some("Deploy to staging".to_string());
+
+        let summary = sidebar_work_summary(&mut app);
+        let text = lines_to_text(&work_panel_lines(
+            &summary,
+            80,
+            8,
+            PaletteMode::Dark,
+            &palette::UI_THEME,
+        ));
+
+        assert!(
+            text.first().is_some_and(|line| line.contains('⏸')),
+            "paused command should use pause icon: {text:?}"
+        );
+        assert!(
+            text.first()
+                .is_some_and(|line| line.contains("Deploy to staging")),
+            "paused command title should remain visible: {text:?}"
+        );
+        assert!(
+            text.first().is_some_and(|line| line.contains("(Paused)")),
+            "paused state should be visible: {text:?}"
+        );
     }
 
     #[test]
