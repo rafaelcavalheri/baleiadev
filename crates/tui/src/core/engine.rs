@@ -658,7 +658,7 @@ fn subagent_mailbox_best_effort_send_permitted(
 impl Engine {
     fn mode_runtime_instructions(mode: AppMode) -> &'static str {
         match mode {
-            AppMode::Agent => prompts::AGENT_MODE,
+            AppMode::Agent | AppMode::Auto => prompts::AGENT_MODE,
             AppMode::Plan => prompts::PLAN_MODE,
             AppMode::Yolo => prompts::YOLO_MODE,
         }
@@ -2181,7 +2181,7 @@ impl Engine {
             &content,
             allow_shell,
             trust_mode,
-            auto_approve,
+            mode == AppMode::Yolo || auto_approve,
             approval_mode,
         );
         if let Some(status) = input_policy.status.clone() {
@@ -2432,7 +2432,7 @@ impl Engine {
         };
 
         let mut tool_registry = match input_policy.mode {
-            AppMode::Agent | AppMode::Yolo => {
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => {
                 if subagents_available {
                     let runtime = if let Some(client) = self.deepseek_client.clone() {
                         let mut rt = SubAgentRuntime::new(
@@ -3434,13 +3434,16 @@ fn effective_input_policy(
         let had_auto_authority = matches!(mode, AppMode::Yolo)
             || trust_mode
             || auto_approve
-            || matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto);
+            || matches!(approval_mode, crate::tui::approval::ApprovalMode::Bypass);
         if matches!(mode, AppMode::Yolo) {
             mode = AppMode::Agent;
         }
         trust_mode = false;
         auto_approve = false;
-        if matches!(approval_mode, crate::tui::approval::ApprovalMode::Auto) {
+        if matches!(
+            approval_mode,
+            crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Bypass
+        ) {
             approval_mode = crate::tui::approval::ApprovalMode::Suggest;
         }
         if had_auto_authority {
@@ -3518,7 +3521,7 @@ fn agent_approval_mode_for_turn(
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> crate::tui::approval::ApprovalMode {
     if auto_approve {
-        crate::tui::approval::ApprovalMode::Auto
+        crate::tui::approval::ApprovalMode::Bypass
     } else {
         approval_mode
     }
@@ -3657,9 +3660,9 @@ fn tool_ask_rule_decision_for_context(
     let cwd = workspace.to_string_lossy();
     let ask_for_approval = match approval_mode {
         crate::tui::approval::ApprovalMode::Never => AskForApproval::Never,
-        crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Suggest => {
-            AskForApproval::OnFailure
-        }
+        crate::tui::approval::ApprovalMode::Auto
+        | crate::tui::approval::ApprovalMode::Bypass
+        | crate::tui::approval::ApprovalMode::Suggest => AskForApproval::OnFailure,
     };
     let decision = config
         .exec_policy_engine

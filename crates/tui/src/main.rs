@@ -6896,7 +6896,7 @@ async fn run_exec_agent(
             translation_enabled: false,
             show_thinking: settings.show_thinking,
             approval_mode: if auto_approve {
-                crate::tui::approval::ApprovalMode::Auto
+                crate::tui::approval::ApprovalMode::Bypass
             } else {
                 execution_config
                     .approval_policy

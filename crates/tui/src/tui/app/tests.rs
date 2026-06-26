@@ -1394,28 +1394,37 @@ fn clear_todos_resets_plan_state() {
 fn app_mode_helpers_centralize_parse_labels_and_cycle_order() {
     assert_eq!(AppMode::parse("agent"), Some(AppMode::Agent));
     assert_eq!(AppMode::parse("2"), Some(AppMode::Plan));
+    assert_eq!(AppMode::parse("auto"), Some(AppMode::Auto));
+    assert_eq!(AppMode::parse("3"), Some(AppMode::Auto));
     assert_eq!(AppMode::parse("YOLO"), Some(AppMode::Yolo));
+    assert_eq!(AppMode::parse("4"), Some(AppMode::Yolo));
     assert_eq!(AppMode::parse("fast"), None);
 
     assert_eq!(AppMode::Agent.as_setting(), "agent");
+    assert_eq!(AppMode::Auto.as_setting(), "auto");
     assert_eq!(AppMode::Plan.display_name(), "Plan");
+    assert_eq!(AppMode::Auto.label(), "AUTO");
     assert_eq!(AppMode::Yolo.label(), "YOLO");
     assert_eq!(AppMode::Agent.number(), '1');
+    assert_eq!(AppMode::Auto.number(), '3');
+    assert_eq!(AppMode::Yolo.number(), '4');
     assert_eq!(
         AppMode::CHOICES,
-        [AppMode::Agent, AppMode::Plan, AppMode::Yolo]
+        [AppMode::Agent, AppMode::Plan, AppMode::Auto, AppMode::Yolo]
     );
     assert_eq!(
         AppMode::CYCLE,
-        [AppMode::Plan, AppMode::Agent, AppMode::Yolo]
+        [AppMode::Plan, AppMode::Agent, AppMode::Auto, AppMode::Yolo]
     );
 
     assert_eq!(AppMode::Plan.next(), AppMode::Agent);
-    assert_eq!(AppMode::Agent.next(), AppMode::Yolo);
+    assert_eq!(AppMode::Agent.next(), AppMode::Auto);
+    assert_eq!(AppMode::Auto.next(), AppMode::Yolo);
     assert_eq!(AppMode::Yolo.next(), AppMode::Plan);
     assert_eq!(AppMode::Plan.previous(), AppMode::Yolo);
     assert_eq!(AppMode::Agent.previous(), AppMode::Plan);
-    assert_eq!(AppMode::Yolo.previous(), AppMode::Agent);
+    assert_eq!(AppMode::Auto.previous(), AppMode::Agent);
+    assert_eq!(AppMode::Yolo.previous(), AppMode::Auto);
 }
 
 #[test]
@@ -1435,11 +1444,15 @@ fn test_cycle_mode_reverse_transitions() {
     app.cycle_mode_reverse();
     assert_eq!(app.mode, AppMode::Yolo);
 
+    app.mode = AppMode::Yolo;
+    app.cycle_mode_reverse();
+    assert_eq!(app.mode, AppMode::Auto);
+
     app.mode = AppMode::Agent;
     app.cycle_mode_reverse();
     assert_eq!(app.mode, AppMode::Plan);
 
-    app.mode = AppMode::Yolo;
+    app.mode = AppMode::Auto;
     app.cycle_mode_reverse();
     assert_eq!(app.mode, AppMode::Agent);
 }
@@ -1579,7 +1592,7 @@ fn set_mode_yolo_restores_previous_policies_on_exit() {
     app.set_mode(AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert!(!app.allow_shell);
@@ -1624,7 +1637,7 @@ fn set_mode_plan_to_yolo_keeps_yolo_permissions_and_restores_agent_baseline() {
     assert_eq!(app.mode, AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert_eq!(app.mode, AppMode::Agent);
@@ -1659,12 +1672,20 @@ fn base_policy_for_mode_projects_the_mode_permission_table() {
     assert_eq!(agent.approval_mode, ApprovalMode::Never);
     assert!(!agent.auto_approve);
 
+    // Auto: shell-enabled smart review, no trust authority.
+    let auto = base_policy_for_mode(AppMode::Auto, &prefs);
+    assert_eq!(auto.mode, AppMode::Auto);
+    assert!(auto.allow_shell);
+    assert!(!auto.trust_mode);
+    assert_eq!(auto.approval_mode, ApprovalMode::Auto);
+    assert!(!auto.auto_approve);
+
     // YOLO: full authority regardless of the baseline.
     let yolo = base_policy_for_mode(AppMode::Yolo, &prefs);
     assert_eq!(yolo.mode, AppMode::Yolo);
     assert!(yolo.allow_shell);
     assert!(yolo.trust_mode);
-    assert_eq!(yolo.approval_mode, ApprovalMode::Auto);
+    assert_eq!(yolo.approval_mode, ApprovalMode::Bypass);
     assert!(yolo.auto_approve);
 
     // A minimal Agent baseline projects through Agent unchanged.
@@ -1695,7 +1716,7 @@ fn set_mode_agent_to_yolo_to_agent_restores_baseline_without_yolo_leak() {
     app.set_mode(AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
     assert!(app.yolo);
 
     app.set_mode(AppMode::Agent);
@@ -1734,7 +1755,7 @@ fn set_mode_plan_to_yolo_to_agent_does_not_bleed_yolo_into_agent() {
     app.set_mode(AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert_eq!(app.mode, AppMode::Agent);
@@ -1782,7 +1803,7 @@ fn leaving_yolo_after_startup_restores_baseline_policies() {
     assert_eq!(app.mode, AppMode::Yolo);
     assert!(app.allow_shell);
     assert!(app.trust_mode);
-    assert_eq!(app.approval_mode, ApprovalMode::Auto);
+    assert_eq!(app.approval_mode, ApprovalMode::Bypass);
 
     app.set_mode(AppMode::Agent);
     assert!(!app.allow_shell);

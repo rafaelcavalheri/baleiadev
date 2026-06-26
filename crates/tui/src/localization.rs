@@ -551,9 +551,11 @@ pub enum MessageId {
     // App mode picker (prompt, names, hints) and composer vim indicator.
     ModePickerPrompt,
     AppModeAgent,
+    AppModeAuto,
     AppModeYolo,
     AppModePlan,
     AppModeAgentHint,
+    AppModeAutoHint,
     AppModePlanHint,
     AppModeYoloHint,
     VimModeNormal,
@@ -1001,9 +1003,11 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::FanoutCounts,
     MessageId::ModePickerPrompt,
     MessageId::AppModeAgent,
+    MessageId::AppModeAuto,
     MessageId::AppModeYolo,
     MessageId::AppModePlan,
     MessageId::AppModeAgentHint,
+    MessageId::AppModeAutoHint,
     MessageId::AppModePlanHint,
     MessageId::AppModeYoloHint,
     MessageId::VimModeNormal,
@@ -1361,6 +1365,7 @@ mod tests {
         let sentences = [
             MessageId::ModePickerPrompt,
             MessageId::AppModeAgentHint,
+            MessageId::AppModeAutoHint,
             MessageId::AppModePlanHint,
             MessageId::AppModeYoloHint,
         ];

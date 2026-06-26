@@ -1178,6 +1178,7 @@ pub(crate) fn footer_mode_style(app: &App) -> (&'static str, ratatui::style::Col
     let label = app.mode.as_setting();
     let color = match app.mode {
         crate::tui::app::AppMode::Agent => app.ui_theme.mode_agent,
+        crate::tui::app::AppMode::Auto => app.ui_theme.mode_agent,
         crate::tui::app::AppMode::Yolo => app.ui_theme.mode_yolo,
         crate::tui::app::AppMode::Plan => app.ui_theme.mode_plan,
     };

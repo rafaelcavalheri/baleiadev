@@ -162,6 +162,7 @@ fn onboarding_is_workspace_trust_gate(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppMode {
     Agent,
+    Auto,
     Yolo,
     Plan,
 }
@@ -900,18 +901,21 @@ const MAX_COMPOSER_DISPLAY_CHARS: usize = 4_000;
 const MAX_DRAFT_HISTORY: usize = 50;
 
 impl AppMode {
-    /// Keyboard cycle order: Plan -> Agent -> YOLO -> Plan.
-    pub const CYCLE: [Self; 3] = [Self::Plan, Self::Agent, Self::Yolo];
+    /// Keyboard cycle order: Plan -> Agent -> Auto -> YOLO -> Plan.
+    pub const CYCLE: [Self; 4] = [Self::Plan, Self::Agent, Self::Auto, Self::Yolo];
 
     /// User-facing picker / numeric command order.
-    pub const CHOICES: [Self; 3] = [Self::Agent, Self::Plan, Self::Yolo];
+    pub const CHOICES: [Self; 4] = [Self::Agent, Self::Plan, Self::Auto, Self::Yolo];
 
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "agent" | "1" => Some(Self::Agent),
             "plan" | "2" => Some(Self::Plan),
-            "yolo" | "3" => Some(Self::Yolo),
+            "auto" | "3" => Some(Self::Auto),
+            "yolo" | "4" | "bypass" | "bypass-permissions" | "bypasspermissions" => {
+                Some(Self::Yolo)
+            }
             _ => None,
         }
     }
@@ -925,6 +929,7 @@ impl AppMode {
     pub fn as_setting(self) -> &'static str {
         match self {
             Self::Agent => "agent",
+            Self::Auto => "auto",
             Self::Yolo => "yolo",
             Self::Plan => "plan",
         }
@@ -934,6 +939,7 @@ impl AppMode {
     pub fn label(self) -> &'static str {
         match self {
             AppMode::Agent => "AGENT",
+            AppMode::Auto => "AUTO",
             AppMode::Yolo => "YOLO",
             AppMode::Plan => "PLAN",
         }
@@ -943,6 +949,7 @@ impl AppMode {
     pub fn display_name(self) -> &'static str {
         match self {
             AppMode::Agent => "Agent",
+            AppMode::Auto => "Auto",
             AppMode::Yolo => "YOLO",
             AppMode::Plan => "Plan",
         }
@@ -953,7 +960,8 @@ impl AppMode {
         match self {
             AppMode::Agent => '1',
             AppMode::Plan => '2',
-            AppMode::Yolo => '3',
+            AppMode::Auto => '3',
+            AppMode::Yolo => '4',
         }
     }
 
@@ -964,6 +972,7 @@ impl AppMode {
             locale,
             match self {
                 AppMode::Agent => MessageId::AppModeAgent,
+                AppMode::Auto => MessageId::AppModeAuto,
                 AppMode::Yolo => MessageId::AppModeYolo,
                 AppMode::Plan => MessageId::AppModePlan,
             },
@@ -978,6 +987,7 @@ impl AppMode {
             match self {
                 AppMode::Agent => MessageId::AppModeAgentHint,
                 AppMode::Plan => MessageId::AppModePlanHint,
+                AppMode::Auto => MessageId::AppModeAutoHint,
                 AppMode::Yolo => MessageId::AppModeYoloHint,
             },
         )
@@ -988,6 +998,7 @@ impl AppMode {
     pub fn description(self) -> &'static str {
         match self {
             AppMode::Agent => "Agent mode - autonomous task execution with tools",
+            AppMode::Auto => "Auto mode - shell enabled with automatic risk review",
             AppMode::Yolo => "YOLO mode - full tool access without approvals",
             AppMode::Plan => "Plan mode - design before implementing",
         }
@@ -1110,7 +1121,8 @@ struct EffectiveModePolicy {
 /// This is the single source of truth for the mode/permission table (#3386):
 /// - `Plan`   → read-only: no shell, no trust, `Suggest` approvals.
 /// - `Agent`  → the user's durable baseline (`prefs`).
-/// - `Yolo`   → full authority: shell + trust + `Auto` approvals.
+/// - `Auto`   → shell-enabled Agent with automatic risk review, no trust.
+/// - `Yolo`   → full authority: shell + trust + `Bypass` approvals.
 ///
 /// Pure and side-effect free so it can be unit-tested directly and reused by
 /// any policy consumer.
@@ -1130,11 +1142,18 @@ fn base_policy_for_mode(mode: AppMode, prefs: &ModeSessionPrefs) -> EffectiveMod
             approval_mode: prefs.agent_approval_mode,
             auto_approve: false,
         },
+        AppMode::Auto => EffectiveModePolicy {
+            mode,
+            allow_shell: true,
+            trust_mode: false,
+            approval_mode: ApprovalMode::Auto,
+            auto_approve: false,
+        },
         AppMode::Yolo => EffectiveModePolicy {
             mode,
             allow_shell: true,
             trust_mode: true,
-            approval_mode: ApprovalMode::Auto,
+            approval_mode: ApprovalMode::Bypass,
             auto_approve: true,
         },
     }
@@ -2454,21 +2473,20 @@ impl App {
             needs_workspace_trust,
         );
 
-        // Durable Agent-era permission baseline (#3386). Plan/YOLO derive from
-        // and restore to this. When the user starts in YOLO the live shell flag
-        // is force-enabled below, so the baseline shell value is taken from
-        // config (the pre-YOLO surface) rather than the live mirror; otherwise
-        // it mirrors the resolved `allow_shell` option. Trust is never part of
-        // the Agent baseline (it is YOLO-only authority). Approval mirrors the
-        // configured policy. This preserves the exact values the previous
-        // `YoloRestoreState`/`PlanRestoreState` snapshots restored.
+        // Durable Agent-era permission baseline (#3386). Plan/Auto/YOLO derive
+        // from and restore to this. When the user starts in Auto or YOLO the
+        // live shell flag is force-enabled below, so the baseline shell value is
+        // taken from config (the pre-mode surface) rather than the live mirror;
+        // otherwise it mirrors the resolved `allow_shell` option. Trust is
+        // never part of the Agent baseline (it is YOLO-only authority). Approval
+        // mirrors the configured policy.
         let configured_approval_mode = config
             .approval_policy
             .as_deref()
             .and_then(ApprovalMode::from_config_value)
             .unwrap_or_default();
         let mode_prefs = ModeSessionPrefs {
-            agent_allow_shell: if initial_mode == AppMode::Yolo {
+            agent_allow_shell: if matches!(initial_mode, AppMode::Auto | AppMode::Yolo) {
                 config.allow_shell()
             } else {
                 allow_shell
@@ -2476,7 +2494,7 @@ impl App {
             agent_trust_mode: false,
             agent_approval_mode: configured_approval_mode,
         };
-        let allow_shell = allow_shell || initial_mode == AppMode::Yolo;
+        let allow_shell = allow_shell || matches!(initial_mode, AppMode::Auto | AppMode::Yolo);
         let shell_manager = new_shared_shell_manager(workspace.clone());
 
         // Initialize hooks executor from config, merged with project-local
@@ -2665,6 +2683,8 @@ impl App {
             approval_session_approved: HashSet::new(),
             approval_session_denied: HashSet::new(),
             approval_mode: if matches!(initial_mode, AppMode::Yolo) {
+                ApprovalMode::Bypass
+            } else if matches!(initial_mode, AppMode::Auto) {
                 ApprovalMode::Auto
             } else {
                 config

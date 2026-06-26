@@ -619,6 +619,7 @@ impl<'a> ComposerWidget<'a> {
     fn mode_color(&self) -> Color {
         match self.app.mode {
             AppMode::Agent => palette::MODE_AGENT,
+            AppMode::Auto => palette::MODE_AGENT,
             AppMode::Yolo => palette::MODE_YOLO,
             AppMode::Plan => palette::MODE_PLAN,
         }

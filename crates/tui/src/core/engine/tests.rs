@@ -645,14 +645,14 @@ fn auto_review_policy_preserves_yolo_for_detached_destructive_tools() {
             "exec_shell",
             &json!({"command": "cargo test", "background": true}),
             run_origin,
-            crate::tui::approval::ApprovalMode::Auto,
+            crate::tui::approval::ApprovalMode::Bypass,
             Some("run tests in the background"),
             true,
             false,
         );
 
         assert_eq!(decision, AutoReviewPlanDecision::NoChange);
-        assert_eq!(audit["approval_mode"], "AUTO");
+        assert_eq!(audit["approval_mode"], "BYPASS");
         assert_eq!(audit["run_origin"], run_origin.as_str());
         assert_eq!(audit["decision"], "ask_user");
     }
@@ -3089,11 +3089,11 @@ fn turn_approval_mode_prefers_auto_approve_flag() {
 
     assert_eq!(
         agent_approval_mode_for_turn(true, ApprovalMode::Suggest),
-        ApprovalMode::Auto
+        ApprovalMode::Bypass
     );
     assert_eq!(
         agent_approval_mode_for_turn(true, ApprovalMode::Never),
-        ApprovalMode::Auto
+        ApprovalMode::Bypass
     );
 }
 

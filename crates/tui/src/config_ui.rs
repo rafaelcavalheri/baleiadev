@@ -155,6 +155,7 @@ pub enum WebConfigSessionEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalModeValue {
     Auto,
+    Bypass,
     Suggest,
     Never,
 }
@@ -230,6 +231,7 @@ pub enum TranscriptSpacingValue {
 pub enum DefaultModeValue {
     Agent,
     Plan,
+    Auto,
     Yolo,
 }
 
@@ -714,6 +716,7 @@ impl ApprovalModeValue {
     fn as_setting(self) -> &'static str {
         match self {
             Self::Auto => "auto",
+            Self::Bypass => "bypass",
             Self::Suggest => "suggest",
             Self::Never => "never",
         }
@@ -839,6 +842,7 @@ impl DefaultModeValue {
         match self {
             Self::Agent => "agent",
             Self::Plan => "plan",
+            Self::Auto => "auto",
             Self::Yolo => "yolo",
         }
     }
@@ -880,6 +884,7 @@ impl From<ApprovalMode> for ApprovalModeValue {
     fn from(value: ApprovalMode) -> Self {
         match value {
             ApprovalMode::Auto => Self::Auto,
+            ApprovalMode::Bypass => Self::Bypass,
             ApprovalMode::Suggest => Self::Suggest,
             ApprovalMode::Never => Self::Never,
         }
@@ -950,6 +955,7 @@ impl From<&str> for DefaultModeValue {
         match AppMode::from_setting(value) {
             AppMode::Agent => Self::Agent,
             AppMode::Plan => Self::Plan,
+            AppMode::Auto => Self::Auto,
             AppMode::Yolo => Self::Yolo,
         }
     }
@@ -1211,7 +1217,7 @@ background_color = "#1A1B26"
         let approval_mode = &schema["$defs"]["ApprovalModeValue"]["enum"];
         assert_eq!(
             approval_mode,
-            &serde_json::json!(["auto", "suggest", "never"])
+            &serde_json::json!(["auto", "bypass", "suggest", "never"])
         );
         let locale = &schema["$defs"]["UiLocale"]["enum"];
         assert_eq!(

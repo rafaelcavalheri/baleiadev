@@ -525,6 +525,7 @@ fn parse_config_bool(value: &str) -> Result<bool, String> {
 fn approval_mode_config_value(mode: ApprovalMode) -> &'static str {
     match mode {
         ApprovalMode::Auto => "auto",
+        ApprovalMode::Bypass => "bypass",
         ApprovalMode::Suggest => "on-request",
         ApprovalMode::Never => "never",
     }
@@ -2378,7 +2379,7 @@ Rule count: 2\n\
         assert!(app.allow_shell);
         assert!(app.trust_mode);
         assert!(app.yolo);
-        assert_eq!(app.approval_mode, ApprovalMode::Auto);
+        assert_eq!(app.approval_mode, ApprovalMode::Bypass);
         assert_eq!(app.mode, AppMode::Yolo);
     }
 
@@ -2391,6 +2392,9 @@ Rule count: 2\n\
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Plan)));
         assert_eq!(app.mode, AppMode::Plan);
         let result = mode(&mut app, Some("3"));
+        assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Auto)));
+        assert_eq!(app.mode, AppMode::Auto);
+        let result = mode(&mut app, Some("4"));
         assert_eq!(result.action, Some(AppAction::ModeChanged(AppMode::Yolo)));
         assert_eq!(app.mode, AppMode::Yolo);
     }

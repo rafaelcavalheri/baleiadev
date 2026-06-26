@@ -15,15 +15,15 @@ use crate::worker_profile::ShellPolicy;
 ///   files inside the workspace because it whitelisted the workspace as
 ///   writable. Plan mode is investigation only; if the user wants to change
 ///   files they should switch to Agent.
-/// - **Agent**: `WorkspaceWrite` with workspace as writable root and network
-///   on. Approval flow gates risky individual commands; the sandbox handles
-///   the rest. Network is allowed because cargo / npm / curl-style commands
-///   are normal during agent work and DNS-deny breaks them silently.
+/// - **Agent/Auto**: `WorkspaceWrite` with workspace as writable root and
+///   network on. Approval flow gates risky individual commands; the sandbox
+///   handles the rest. Network is allowed because cargo / npm / curl-style
+///   commands are normal during agent work and DNS-deny breaks them silently.
 /// - **YOLO**: `DangerFullAccess` — explicit no-guardrails contract.
 pub(crate) fn sandbox_policy_for_mode(mode: AppMode, workspace: &Path) -> SandboxPolicy {
     match mode {
         AppMode::Plan => SandboxPolicy::ReadOnly,
-        AppMode::Agent => SandboxPolicy::WorkspaceWrite {
+        AppMode::Agent | AppMode::Auto => SandboxPolicy::WorkspaceWrite {
             writable_roots: vec![workspace.to_path_buf()],
             network_access: true,
             exclude_tmpdir: false,
@@ -47,7 +47,7 @@ pub(crate) fn shell_policy_for_mode(mode: AppMode, allow_shell: bool) -> ShellPo
         // registry would expose `exec_shell` while the prompt said there was
         // no shell). Keep Plan shell-free; switch to Agent to run commands.
         AppMode::Plan => ShellPolicy::None,
-        AppMode::Agent | AppMode::Yolo => ShellPolicy::Full,
+        AppMode::Agent | AppMode::Auto | AppMode::Yolo => ShellPolicy::Full,
     }
 }
 

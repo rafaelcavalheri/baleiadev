@@ -227,7 +227,7 @@ fn should_auto_approve_approval_request(
 }
 
 fn app_auto_approve_enabled(app: &App) -> bool {
-    app.mode == AppMode::Yolo || app.approval_mode == ApprovalMode::Auto
+    app.mode == AppMode::Yolo || app.approval_mode == ApprovalMode::Bypass
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

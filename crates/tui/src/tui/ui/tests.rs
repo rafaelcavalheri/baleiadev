@@ -1901,6 +1901,14 @@ fn forced_approval_prompt_bypasses_session_approval_shortcut() {
 fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
+    assert!(!should_auto_approve_approval_request(
+        &app,
+        "exec_shell",
+        "shell:exec_shell:cargo test",
+        false,
+    ));
+
+    app.approval_mode = ApprovalMode::Bypass;
     assert!(should_auto_approve_approval_request(
         &app,
         "exec_shell",
@@ -1920,13 +1928,16 @@ fn non_forced_approval_request_keeps_existing_auto_shortcuts() {
 }
 
 #[test]
-fn app_auto_approval_helper_covers_yolo_and_live_auto_mode() {
+fn app_auto_approval_helper_covers_yolo_and_bypass_only() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.approval_mode = ApprovalMode::Suggest;
     assert!(!app_auto_approve_enabled(&app));
 
     app.approval_mode = ApprovalMode::Auto;
+    assert!(!app_auto_approve_enabled(&app));
+
+    app.approval_mode = ApprovalMode::Bypass;
     assert!(app_auto_approve_enabled(&app));
 
     app.approval_mode = ApprovalMode::Suggest;
@@ -3511,7 +3522,7 @@ async fn dispatch_resume_message_restores_paused_command_goal() {
 }
 
 #[tokio::test]
-async fn dispatch_user_message_honors_live_auto_approval_mode() {
+async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.approval_mode = ApprovalMode::Auto;
@@ -3537,7 +3548,7 @@ async fn dispatch_user_message_honors_live_auto_approval_mode() {
             ..
         } => {
             assert_eq!(mode, AppMode::Agent);
-            assert!(auto_approve);
+            assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Auto);
         }
         other => panic!("expected SendMessage, got {other:?}"),
@@ -5157,7 +5168,7 @@ async fn bang_shell_input_dispatches_shell_op_instead_of_model_message() {
 }
 
 #[tokio::test]
-async fn bang_shell_input_honors_live_auto_approval_mode() {
+async fn bang_shell_input_keeps_auto_review_separate_from_bypass() {
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.approval_mode = ApprovalMode::Auto;
@@ -5182,7 +5193,7 @@ async fn bang_shell_input_honors_live_auto_approval_mode() {
             assert_eq!(command, "pwd");
             assert_eq!(mode, AppMode::Agent);
             assert!(trust_mode);
-            assert!(auto_approve);
+            assert!(!auto_approve);
             assert_eq!(approval_mode, ApprovalMode::Auto);
         }
         other => panic!("expected RunShellCommand, got {other:?}"),

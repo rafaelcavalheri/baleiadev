@@ -39,8 +39,10 @@ use std::time::{Duration, Instant};
 /// Determines when tool executions require user approval
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ApprovalMode {
-    /// Auto-approve all tools (YOLO mode / --yolo flag)
+    /// Automatically review risky tool calls before deciding whether to ask.
     Auto,
+    /// Bypass approvals entirely (YOLO mode / --yolo flag).
+    Bypass,
     /// Suggest approval for non-safe tools (non-YOLO modes)
     #[default]
     Suggest,
@@ -52,6 +54,7 @@ impl ApprovalMode {
     pub fn label(self) -> &'static str {
         match self {
             ApprovalMode::Auto => "AUTO",
+            ApprovalMode::Bypass => "BYPASS",
             ApprovalMode::Suggest => "SUGGEST",
             ApprovalMode::Never => "NEVER",
         }
@@ -60,6 +63,8 @@ impl ApprovalMode {
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "auto" => Some(ApprovalMode::Auto),
+            "bypass" | "yolo" | "dontask" | "dont_ask" | "bypass-permissions"
+            | "bypasspermissions" => Some(ApprovalMode::Bypass),
             "suggest" | "suggested" | "on-request" | "untrusted" => Some(ApprovalMode::Suggest),
             "never" | "deny" | "denied" => Some(ApprovalMode::Never),
             _ => None,

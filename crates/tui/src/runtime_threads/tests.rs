@@ -2472,8 +2472,10 @@ fn parse_mode_opt_resolves_explicit_tokens_and_aliases() {
     assert_eq!(parse_mode_opt("1"), Some(AppMode::Agent));
     assert_eq!(parse_mode_opt("plan"), Some(AppMode::Plan));
     assert_eq!(parse_mode_opt("2"), Some(AppMode::Plan));
+    assert_eq!(parse_mode_opt("auto"), Some(AppMode::Auto));
+    assert_eq!(parse_mode_opt("3"), Some(AppMode::Auto));
     assert_eq!(parse_mode_opt("yolo"), Some(AppMode::Yolo));
-    assert_eq!(parse_mode_opt("3"), Some(AppMode::Yolo));
+    assert_eq!(parse_mode_opt("4"), Some(AppMode::Yolo));
     assert_eq!(parse_mode_opt(" PLAN "), Some(AppMode::Plan));
 }
 
@@ -2495,7 +2497,8 @@ fn parse_mode_wrapper_defaults_and_resolves_numeric_aliases() {
     assert_eq!(parse_mode("plan a trip to Tokyo"), AppMode::Agent);
     assert_eq!(parse_mode("1"), AppMode::Agent);
     assert_eq!(parse_mode("2"), AppMode::Plan);
-    assert_eq!(parse_mode("3"), AppMode::Yolo);
+    assert_eq!(parse_mode("3"), AppMode::Auto);
+    assert_eq!(parse_mode("4"), AppMode::Yolo);
 }
 
 fn rebind_event(event: &str, agent_id: &str, seq: u64) -> RuntimeEventRecord {

@@ -335,7 +335,7 @@ fn safety_floor(ctx: &AutoReviewContext<'_>) -> Option<AutoReviewDecision> {
         ));
     }
 
-    if !matches!(ctx.approval_mode, ApprovalMode::Auto)
+    if !matches!(ctx.approval_mode, ApprovalMode::Bypass)
         && matches!(ctx.run_origin, RunOrigin::Headless | RunOrigin::Background)
         && matches!(ctx.risk, RiskLevel::Destructive)
     {
