@@ -1384,6 +1384,40 @@ mod tests {
     }
 
     #[test]
+    fn cache_command_replays_reported_1177_low_hit_fixture() {
+        let mut app = create_test_app();
+        let now = Instant::now();
+        // Fixture from #1177 / douglarek's 2026-05-10 `/cache` report.
+        // It captures a real low-hit sequence with one 56.8% tail turn.
+        for (input, output, hit, miss) in [
+            (25_839, 12, 4_608, 21_231),
+            (25_906, 288, 25_728, 178),
+            (264_500, 2_528, 235_648, 28_852),
+            (202_230, 3_191, 193_536, 8_694),
+            (45_982, 294, 26_112, 19_870),
+        ] {
+            app.push_turn_cache_record(TurnCacheRecord {
+                input_tokens: input,
+                output_tokens: output,
+                cache_hit_tokens: Some(hit),
+                cache_miss_tokens: Some(miss),
+                reasoning_replay_tokens: None,
+                recorded_at: now,
+            });
+        }
+
+        let result = cache(&mut app, None);
+        let msg = result.message.expect("cache produces a message");
+
+        assert!(msg.contains("last 5 of 5 turn(s)"), "got: {msg}");
+        assert!(msg.contains("56.8%"), "got: {msg}");
+        assert!(msg.contains("Σ in: 564457"), "got: {msg}");
+        assert!(msg.contains("Σ hit: 485632"), "got: {msg}");
+        assert!(msg.contains("Σ miss: 78825"), "got: {msg}");
+        assert!(msg.contains("avg hit ratio: 86.0%"), "got: {msg}");
+    }
+
+    #[test]
     fn cache_command_count_argument_clamps_to_history() {
         let mut app = create_test_app();
         for _ in 0..3 {
@@ -2132,6 +2166,37 @@ mod tests {
         assert!(
             msg.contains("cache hit rate is low"),
             "should show low-hit-rate advisory, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn cache_stats_flags_reported_1747_low_hit_fixture() {
+        let mut app = create_test_app();
+        app.prefix_stability_pct = Some(100);
+        app.prefix_checks_total = 1;
+        app.last_pinned_prefix_hash =
+            Some("abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234".to_string());
+
+        // Fixture from #1747 / Amund's DeepSeek-TUI session aggregate:
+        // hit=21,356,928, miss=8,470,281, output=165,624.
+        app.push_turn_cache_record(TurnCacheRecord {
+            input_tokens: 29_827_209,
+            output_tokens: 165_624,
+            cache_hit_tokens: Some(21_356_928),
+            cache_miss_tokens: Some(8_470_281),
+            reasoning_replay_tokens: None,
+            recorded_at: Instant::now(),
+        });
+
+        let result = cache(&mut app, Some("stats"));
+        let msg = result.message.expect("cache stats produces a message");
+
+        assert!(msg.contains("71.6%"), "got: {msg}");
+        assert!(msg.contains("Cache hit tokens:  21.4M"), "got: {msg}");
+        assert!(msg.contains("Cache miss tokens: 8.5M"), "got: {msg}");
+        assert!(
+            msg.contains("cache hit rate is low"),
+            "reported #1747 fixture should remain below the advisory threshold: {msg}"
         );
     }
 
