@@ -63,6 +63,29 @@ Each repo can carry two distinct, complementary files:
 > global CodeWhale Constitution shipped in the model prompt is a separate thing
 > and is unaffected.)
 
+### Overriding the global base prompt (#3638)
+
+The global Constitution (the base system prompt, normally compiled in from
+`prompts/constitution.md`) can be replaced per-user without rebuilding, by
+dropping a file at:
+
+```
+~/.codewhale/prompts/constitution.md
+```
+
+(under `$CODEWHALE_HOME` when set). This is intended for repurposing the TUI
+beyond software engineering — e.g. long-form writing or document review — where
+the engineering-oriented base prompt is a poor fit. It is loaded once at
+startup; a **missing or empty file is a no-op**, so existing installs keep the
+bundled prompt.
+
+Scope is deliberately narrow: only the byte-stable **base prompt segment** is
+overridable. Mode deltas, the approval policy, the tool taxonomy, Context
+Management, and the Compaction Relay are still owned by CodeWhale's runtime
+assembly, so an override **cannot remove safety-relevant guidance** (sandbox,
+approvals) — it only swaps the task/voice framing. To customize per-repo
+behavior instead, prefer `AGENTS.md` + `.codewhale/constitution.json` above.
+
 ## Where It Looks
 
 Default config path:

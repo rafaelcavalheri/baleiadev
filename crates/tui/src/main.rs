@@ -1183,6 +1183,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     logging::set_verbose(cli.verbose || logging::env_requests_verbose_logging());
 
+    // Install any user prompt overrides from the config directory before an
+    // engine can compose a system prompt. The override cells are
+    // first-call-wins; doing this once here keeps every downstream turn
+    // consistent. Missing files are a no-op (bundled defaults). See #3638.
+    crate::prompts::load_prompt_overrides_from_config_home();
+
     // Handle subcommands first
     if let Some(command) = cli.command.clone() {
         return match command {

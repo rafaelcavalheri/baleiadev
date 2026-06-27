@@ -432,6 +432,85 @@ pub fn set_static_prompt_composer_override(
     set_static_prompt_composer(&STATIC_PROMPT_COMPOSER, f)
 }
 
+// ── Config-directory prompt overrides (issue #3638) ──
+// Bridge the embedder override hooks above to a user-facing source: an
+// optional file in the CodeWhale config directory. This lets users repurpose
+// the TUI for non-software use cases (e.g. long-form writing) by swapping the
+// constitutional base prompt, without editing in-tree files or shipping a
+// custom embedder build.
+//
+// Scope is deliberately narrow: only the byte-stable base prompt segment is
+// user-overridable. Mode deltas, approval policy, tool taxonomy, Context
+// Management, and the Compaction Relay stay owned by the runtime assembly (see
+// `StaticPromptCtx`), so an override cannot strip safety-relevant guidance.
+// A missing or empty file is a no-op — the bundled constant is used — so this
+// is fully backward compatible.
+
+/// Relative path, under the config directory, of the optional base-prompt
+/// (constitution) override file.
+pub const CONSTITUTION_OVERRIDE_FILE: &str = "prompts/constitution.md";
+
+/// Read an optional prompt-override file rooted at `config_dir`.
+///
+/// Returns the file contents when it exists and is non-empty after trimming;
+/// otherwise `None` so the caller falls back to the embedded default. Pure
+/// over `config_dir`, so it is unit-testable without touching the global
+/// override cells.
+fn read_prompt_override_file(config_dir: &Path, relative: &str) -> Option<String> {
+    let path = config_dir.join(relative);
+    let raw = std::fs::read_to_string(&path).ok()?;
+    if raw.trim().is_empty() {
+        tracing::warn!(
+            target: "prompts",
+            "ignoring empty prompt override file {}",
+            path.display(),
+        );
+        return None;
+    }
+    tracing::info!(
+        target: "prompts",
+        "loaded prompt override from {}",
+        path.display(),
+    );
+    Some(raw)
+}
+
+/// Load user prompt overrides from `config_dir` and install them through the
+/// existing override hooks. Returns the names of the overrides that were
+/// applied (for logging/diagnostics).
+///
+/// Call once at startup, before any engine spawns, because the underlying
+/// override cells are first-call-wins. Missing files are a no-op, preserving
+/// the bundled defaults.
+pub fn load_config_dir_prompt_overrides(config_dir: &Path) -> Vec<&'static str> {
+    let mut applied = Vec::new();
+    if let Some(text) = read_prompt_override_file(config_dir, CONSTITUTION_OVERRIDE_FILE)
+        && set_base_prompt_override(text).is_ok()
+    {
+        applied.push("constitution");
+    }
+    applied
+}
+
+/// Resolve the CodeWhale config directory and load any prompt overrides found
+/// there. Convenience wrapper around [`load_config_dir_prompt_overrides`] for
+/// startup wiring; silently does nothing when the config home cannot be
+/// resolved.
+pub fn load_prompt_overrides_from_config_home() {
+    let Ok(home) = codewhale_config::codewhale_home() else {
+        return;
+    };
+    let applied = load_config_dir_prompt_overrides(&home);
+    if !applied.is_empty() {
+        tracing::info!(
+            target: "prompts",
+            "applied {} config-directory prompt override(s): {}",
+            applied.len(),
+            applied.join(", "),
+        );
+    }
+}
+
 fn set_prompt_override(cell: &std::sync::OnceLock<String>, s: String) -> Result<(), String> {
     cell.set(s)
 }
@@ -1284,6 +1363,49 @@ mod tests {
     /// Discriminator unique to the injected relay block (not present in the
     /// agent prompt's own discussion of the convention).
     const HANDOFF_BLOCK_MARKER: &str = "left a relay artifact at `.codewhale/handoff.md`";
+
+    // Config-directory prompt override resolution (#3638). These exercise the
+    // pure file resolver only; the global install path is intentionally not
+    // unit-tested here because `set_base_prompt_override` writes a process-wide
+    // `OnceLock` that would leak into sibling tests (same reason
+    // `prompt_override_storage_reports_duplicate_sets` uses a local cell).
+
+    #[test]
+    fn config_override_reads_present_nonempty_file() {
+        let tmp = tempdir().expect("tempdir");
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("mkdir");
+        std::fs::write(
+            prompts_dir.join("constitution.md"),
+            "You are a long-form writing companion.\n",
+        )
+        .expect("write override");
+
+        let got = read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE);
+        assert_eq!(
+            got.as_deref(),
+            Some("You are a long-form writing companion.\n")
+        );
+    }
+
+    #[test]
+    fn config_override_absent_file_falls_back() {
+        let tmp = tempdir().expect("tempdir");
+        // No prompts/ directory at all → None so the embedded constant is used.
+        assert!(read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE).is_none());
+    }
+
+    #[test]
+    fn config_override_empty_file_is_ignored() {
+        let tmp = tempdir().expect("tempdir");
+        let prompts_dir = tmp.path().join("prompts");
+        std::fs::create_dir_all(&prompts_dir).expect("mkdir");
+        std::fs::write(prompts_dir.join("constitution.md"), "   \n\t\n").expect("write blank");
+
+        // Whitespace-only overrides are treated as absent so a stray empty file
+        // can't silently blank the system prompt.
+        assert!(read_prompt_override_file(tmp.path(), CONSTITUTION_OVERRIDE_FILE).is_none());
+    }
 
     #[test]
     fn prompt_override_storage_reports_duplicate_sets() {
