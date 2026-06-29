@@ -310,6 +310,71 @@ fn subagent_progress_displays_shell_tools_as_bash() {
 }
 
 #[test]
+fn agent_progress_preserves_event_channel_headroom_under_load() {
+    let (tx, mut rx) = mpsc::channel(40);
+    for _ in 0..8 {
+        tx.try_send(Event::status("filler")).expect("fill channel");
+    }
+    assert_eq!(tx.capacity(), 32);
+
+    emit_agent_progress(
+        Some(&tx),
+        "agent_busy",
+        "step 1: requesting model response".to_string(),
+        None,
+        1,
+    );
+    assert_eq!(
+        tx.capacity(),
+        32,
+        "routine progress should preserve reserved event-channel headroom"
+    );
+
+    emit_agent_progress(
+        Some(&tx),
+        "agent_waiting",
+        "waiting for user input".to_string(),
+        None,
+        1,
+    );
+    assert_eq!(
+        tx.capacity(),
+        31,
+        "high-value progress should still reach the UI when headroom is reserved"
+    );
+
+    for _ in 0..8 {
+        assert!(matches!(rx.try_recv(), Ok(Event::Status { .. })));
+    }
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Event::AgentProgress { id, status, .. })
+            if id == "agent_waiting" && status == "waiting for user input"
+    ));
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn agent_progress_uses_small_event_channels_without_headroom_reservation() {
+    let (tx, mut rx) = mpsc::channel(8);
+
+    emit_agent_progress(
+        Some(&tx),
+        "agent_small_channel",
+        "step 1: requesting model response".to_string(),
+        None,
+        1,
+    );
+
+    assert_eq!(tx.capacity(), 7);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Event::AgentProgress { id, status, .. })
+            if id == "agent_small_channel" && status == "step 1: requesting model response"
+    ));
+}
+
+#[test]
 fn headless_worker_records_persist_with_subagent_state() {
     let tmp = tempdir().expect("tempdir");
     let state_path = tmp.path().join("subagents.v1.json");

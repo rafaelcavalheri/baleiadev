@@ -83,6 +83,7 @@ const DEFAULT_MAX_STEPS: u32 = u32::MAX;
 /// floors remain the independent stall detectors.
 const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 const MIN_SUBAGENT_SPAWN_TOKEN_RESERVE: u64 = 1;
+const MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS: usize = 32;
 
 /// Format a step counter for sub-agent progress messages.
 ///
@@ -6155,6 +6156,12 @@ fn emit_agent_progress(
     spawn_depth: u32,
 ) {
     if let Some(event_tx) = event_tx {
+        if event_tx.max_capacity() > MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS
+            && event_tx.capacity() <= MIN_EVENT_CHANNEL_HEADROOM_FOR_ROUTINE_PROGRESS
+            && routine_agent_progress_can_preserve_event_headroom(&status)
+        {
+            return;
+        }
         let _ = event_tx.try_send(Event::AgentProgress {
             id: agent_id.to_string(),
             status,
@@ -6162,6 +6169,13 @@ fn emit_agent_progress(
             spawn_depth,
         });
     }
+}
+
+fn routine_agent_progress_can_preserve_event_headroom(status: &str) -> bool {
+    matches!(
+        worker_progress_event_parts(status).0,
+        AgentWorkerStatus::Running | AgentWorkerStatus::ModelWait | AgentWorkerStatus::RunningTool
+    )
 }
 
 // === Tool Registry Helpers ===
