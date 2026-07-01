@@ -26,7 +26,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Block, Borders, Paragraph, Widget, Wrap},
 };
 
 use crate::config::{
@@ -38,8 +38,8 @@ use crate::model_profile::{SupportState, resolved_capability_profile};
 use crate::palette;
 use crate::tui::app::ReasoningEffort;
 use crate::tui::views::{
-    ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
-    render_modal_footer, render_modal_surface,
+    ActionHint, EmptyState, ListDetailLayout, ModalKind, ModalView, ViewAction, ViewEvent,
+    centered_modal_area, render_modal_footer, render_modal_surface,
 };
 use codewhale_config::catalog::{CatalogOffering, CatalogSnapshot};
 use codewhale_config::provider::WireFormat;
@@ -1402,25 +1402,22 @@ impl ProviderPickerView {
 
         let filtered = self.filtered_rows();
         if filtered.is_empty() {
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    "No providers configured yet.",
-                    Style::default().fg(palette::TEXT_MUTED),
-                )),
-                Line::from(Span::styled(
-                    "Press A to browse every supported provider and add one.",
-                    Style::default().fg(palette::TEXT_MUTED),
-                )),
-            ])
+            EmptyState::new(
+                "No providers configured yet",
+                "Browse every supported provider or create a custom endpoint.",
+            )
+            .primary_action("A", "browse all")
+            .secondary_action("C", "custom")
             .render(content, buf);
             return;
         }
 
+        let layout = ListDetailLayout::split(content, 34);
         let selected_pos = filtered
             .iter()
             .position(|(idx, _)| *idx == self.selected_idx)
             .unwrap_or(0);
-        let visible_rows = usize::from(content.height);
+        let visible_rows = usize::from(layout.list.height);
         let visible_start = Self::visible_start(selected_pos, filtered.len(), visible_rows);
         let mut lines: Vec<Line> = Vec::with_capacity(visible_rows);
         for (pos, (idx, row)) in filtered
@@ -1468,7 +1465,7 @@ impl ProviderPickerView {
             ]);
             if is_selected {
                 line.style = Self::selected_row_bg_style();
-                let target_width = usize::from(content.width);
+                let target_width = usize::from(layout.list.width);
                 let line_width = line.width();
                 if line_width < target_width {
                     line.spans.push(Span::styled(
@@ -1479,7 +1476,91 @@ impl ProviderPickerView {
             }
             lines.push(line);
         }
-        Paragraph::new(lines).render(content, buf);
+        Paragraph::new(lines).render(layout.list, buf);
+        self.render_provider_detail(layout.detail, buf, &self.rows[self.selected_idx]);
+    }
+
+    fn render_provider_detail(&self, area: Rect, buf: &mut Buffer, row: &ProviderDashboardRow) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let block = Block::default()
+            .title(Line::from(Span::styled(
+                " Details ",
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette::BORDER_COLOR))
+            .style(Style::default());
+        let inner = block.inner(area);
+        block.render(area, buf);
+
+        let route = if row.default_route.logical_model == row.default_route.wire_model {
+            row.default_route.logical_model.clone()
+        } else {
+            format!(
+                "{} -> {}",
+                row.default_route.logical_model, row.default_route.wire_model
+            )
+        };
+        let mut lines = vec![
+            Line::from(Span::styled(
+                row.display_name.clone(),
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "{} | {} | {}",
+                    row.readiness.label(),
+                    row.auth_status.label(),
+                    row.catalog_label()
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!("Route: {route}"),
+                Style::default().fg(palette::TEXT_PRIMARY),
+            )),
+            Line::from(Span::styled(
+                format!("Endpoint: {}", row.base_url),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!(
+                    "Protocol: {} | Usage: {}",
+                    row.supported_protocols.join("+"),
+                    row.usage_meter
+                ),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!("Capabilities: {}", row.capabilities.label()),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+            Line::from(Span::styled(
+                format!("Reasoning: {}", row.reasoning.label()),
+                Style::default().fg(palette::TEXT_MUTED),
+            )),
+        ];
+        if let Some(concurrency) = row.request_concurrency.label() {
+            lines.push(Line::from(Span::styled(
+                concurrency,
+                Style::default().fg(palette::TEXT_MUTED),
+            )));
+        }
+        for message in row.messages.iter().take(2) {
+            lines.push(Line::from(Span::styled(
+                format!("Note: {message}"),
+                Style::default().fg(palette::STATUS_WARNING),
+            )));
+        }
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .render(inner, buf);
     }
 
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
@@ -2855,10 +2936,10 @@ mod tests {
 
         assert!(rendered.contains("key:configured"));
         assert!(!rendered.contains("auth:configured"));
-        assert!(rendered.contains("route:custom-model"));
+        assert!(rendered.contains("Route: custom-model"));
         assert!(rendered.contains("chat"));
         assert!(rendered.contains("cost: unknown"));
-        assert!(rendered.contains("localhost:9000/v1"));
+        assert!(rendered.contains("Endpoint: http://localhost:9000/v1"));
     }
 
     #[test]
@@ -3116,7 +3197,7 @@ mod tests {
     }
 
     #[test]
-    fn tall_list_render_shows_all_providers_without_scrolling() {
+    fn tall_catalog_render_shows_selected_provider_details() {
         let config = Config::default();
         let mut picker = ProviderPickerView::new(ApiProvider::Deepseek, &config);
         // "All providers" means the full catalog (#3830), not just configured.
@@ -3125,7 +3206,8 @@ mod tests {
         let rendered = render_text(&picker, 80, 23);
 
         assert!(rendered.contains("DeepSeek *"));
-        assert!(rendered.contains("Ollama"));
+        assert!(rendered.contains("Details"));
+        assert!(rendered.contains("Route:"));
     }
 
     /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
