@@ -176,6 +176,54 @@ cargo fmt --all -- --check                                  PASS
 cd web && npm run build                                     prerenders all locale routes
 ```
 
+## Overnight Review + Hardening Snapshot (2026-07-02)
+
+- Branch: `claude/v0.8.67-constitution-setup-174rj9`
+- Head: `44eb7e935` (~35 commits ahead of origin; branch diff touches only
+  `crates/`, `web/`, `docs/`, `scripts/`, `Cargo.*`)
+
+A five-lens adversarial ultracode review of the overnight diff ran (34
+agents; correctness / constitution-safety-invariants / performance / UX /
+test-adequacy, each finding refuted-or-confirmed by an independent skeptic).
+Confirmed findings were fixed:
+
+- **Safety-floor destroyer gap** (`88c545f2b`): the #3883 floor narrowing had
+  stopped holding `dd`-to-device / `mkfs` / `shred` / `wipefs` / forced
+  recursive deletion of absolute system paths in YOLO background;
+  `segment_is_device_or_filesystem_destroyer` restores those holds.
+- **Repo law as mechanism** (`88c545f2b`): `.codewhale/constitution.json`
+  `protected_invariants` may now carry path globs + `action` (ask|block),
+  compiled into write holds in the tool gate (`crates/tui/src/repo_law.rs`),
+  tighten-only, non-bypassable by mode, with a receipt naming the invariant.
+- **Boot-janitor races** (`007ce2680`): backgrounded session cleanup no longer
+  races session restore (skips/excludes the resumed id).
+- **Event-loop-freeze class closed**: both the fleet-profile (`138dbad1b`) and
+  constitution (`58aefa392`) model drafters moved off the inline await onto the
+  background-cell + poll pattern; the UI stays interactive during drafting.
+- **Fleet-draft finish + UX parity** (`007ce2680`): provider-readiness gating,
+  en+zh localization, Enter-ratifies, duplicate-id guard.
+- **UX copy** (`126633e78`, `e09fd46c2`): status classifier no longer paints
+  negated-success failures green; shell exit codes are human-readable; lock
+  jargon replaced with actionable copy; GitHub issue numbers removed from
+  `--help` and config UI; session/model pickers have actionable empty states.
+- **Test-adequacy gaps** (`432fa0fbe`) and a headless QA probe
+  (`scripts/v0867-setup-qa.sh`, `93b5c1e59`) added.
+- **#3830 missing-auth handoff** (`e2b32ec4c`): a route switch that fails for
+  want of a key opens `/provider` at that provider's key entry.
+
+Final gate battery at this head:
+
+```
+cargo fmt --all -- --check                              PASS
+git diff --check                                        PASS
+jq empty crates/tui/locales/*.json                      PASS (7 files)
+cargo test -p codewhale-tui --bin codewhale-tui --locked  5686 passed; 0 failed; 2 ignored
+cargo test -p codewhale-config --lib                    342 passed; 0 failed
+RUSTFLAGS="-D warnings" cargo test ... --locked --no-run  clean
+cargo build --release -p codewhale-cli -p codewhale-tui   clean (47s)
+scripts/v0867-setup-qa.sh                               9 passed; 0 failed
+```
+
 ## Remaining Manual Evidence
 
 Before the release is called ready, keep the final manual pass from the QA
