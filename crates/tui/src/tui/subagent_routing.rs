@@ -105,10 +105,20 @@ pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) 
 
     let running_ids: std::collections::HashSet<String> =
         running_agents.iter().map(|(id, _)| id.clone()).collect();
+    // Evict a progress row only when the authoritative cache actually knows
+    // the agent and reports it non-running. A progress-only entry — an agent
+    // whose AgentSpawned/AgentList delivery was dropped under channel
+    // pressure so the cache has never seen it — must survive until the cache
+    // supersedes it, or spawned agents flicker in and out of the sidebar.
+    let cached_ids: std::collections::HashSet<&str> = app
+        .subagent_cache
+        .iter()
+        .map(|agent| agent.agent_id.as_str())
+        .collect();
     app.agent_progress
-        .retain(|id, _| running_ids.contains(id.as_str()));
+        .retain(|id, _| running_ids.contains(id.as_str()) || !cached_ids.contains(id.as_str()));
     app.agent_progress_meta
-        .retain(|id, _| running_ids.contains(id.as_str()));
+        .retain(|id, _| running_ids.contains(id.as_str()) || !cached_ids.contains(id.as_str()));
     for (id, objective) in running_agents {
         app.agent_progress.entry(id.clone()).or_insert(objective);
         if let Some(agent) = app.subagent_cache.iter().find(|agent| agent.agent_id == id) {
@@ -724,6 +734,67 @@ mod tests {
         assert!(
             handle_subagent_mailbox(&mut app, 3, &tool),
             "tool progress still updates the visible transcript card"
+        );
+    }
+
+    #[test]
+    fn reconcile_keeps_progress_only_rows_until_cache_knows_the_agent() {
+        let mut app = App::new(test_options(), &Config::default());
+
+        // A progress-first agent: its AgentSpawned/AgentList delivery was
+        // dropped under channel pressure, so the authoritative cache has
+        // never seen it. Its sidebar row must survive reconciliation.
+        app.agent_progress
+            .insert("agent_orphan".to_string(), "step 2/10".to_string());
+        app.agent_progress_meta.insert(
+            "agent_orphan".to_string(),
+            AgentProgressMeta {
+                parent_run_id: None,
+                spawn_depth: 0,
+            },
+        );
+
+        // A terminal agent the cache DOES know about: its stale progress row
+        // must still be evicted.
+        app.subagent_cache
+            .push(subagent_result("agent_done", SubAgentStatus::Completed));
+        app.agent_progress
+            .insert("agent_done".to_string(), "step 9/10".to_string());
+        app.agent_progress_meta.insert(
+            "agent_done".to_string(),
+            AgentProgressMeta {
+                parent_run_id: None,
+                spawn_depth: 0,
+            },
+        );
+
+        reconcile_subagent_activity_state_at(&mut app, Instant::now());
+
+        assert!(
+            app.agent_progress.contains_key("agent_orphan"),
+            "progress-only agent unknown to the cache must survive reconcile"
+        );
+        assert!(
+            app.agent_progress_meta.contains_key("agent_orphan"),
+            "progress-only meta unknown to the cache must survive reconcile"
+        );
+        assert!(
+            !app.agent_progress.contains_key("agent_done"),
+            "cache-known terminal agent progress must still be evicted"
+        );
+        assert!(
+            !app.agent_progress_meta.contains_key("agent_done"),
+            "cache-known terminal agent meta must still be evicted"
+        );
+
+        // Once the authoritative cache reports the orphan as terminal, the
+        // normal eviction applies and the row is released.
+        app.subagent_cache
+            .push(subagent_result("agent_orphan", SubAgentStatus::Completed));
+        reconcile_subagent_activity_state_at(&mut app, Instant::now());
+        assert!(
+            !app.agent_progress.contains_key("agent_orphan"),
+            "cache supersedes the progress-only row once it knows the agent"
         );
     }
 

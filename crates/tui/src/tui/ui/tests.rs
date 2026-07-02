@@ -5310,15 +5310,27 @@ fn reconcile_subagent_activity_state_trims_stale_progress_and_sets_anchor() {
         make_subagent("agent_a", crate::tools::subagent::SubAgentStatus::Running),
         make_subagent("agent_b", crate::tools::subagent::SubAgentStatus::Completed),
     ];
+    // Progress rows for ids the cache does not know survive reconciliation:
+    // a progress-first agent whose AgentSpawned/AgentList delivery was
+    // dropped must not flicker out of the sidebar. Eviction happens once the
+    // authoritative cache reports the agent as non-running.
     app.agent_progress
-        .insert("agent_stale".to_string(), "old".to_string());
+        .insert("agent_pending".to_string(), "old".to_string());
 
     reconcile_subagent_activity_state(&mut app);
     assert!(app.agent_progress.contains_key("agent_a"));
-    assert!(!app.agent_progress.contains_key("agent_stale"));
+    assert!(app.agent_progress.contains_key("agent_pending"));
     assert!(app.agent_activity_started_at.is_some());
 
-    app.subagent_cache.clear();
+    // Once the cache authoritatively knows both agents as terminal, their
+    // progress rows are trimmed and the activity anchor clears.
+    app.subagent_cache = vec![
+        make_subagent("agent_a", crate::tools::subagent::SubAgentStatus::Completed),
+        make_subagent(
+            "agent_pending",
+            crate::tools::subagent::SubAgentStatus::Completed,
+        ),
+    ];
     reconcile_subagent_activity_state(&mut app);
     assert!(app.agent_progress.is_empty());
     assert!(app.agent_activity_started_at.is_none());

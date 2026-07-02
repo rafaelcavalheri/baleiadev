@@ -2982,6 +2982,15 @@ async fn run_event_loop(
                         // observed — assign the stable label on first sight.
                         let label = app.ensure_agent_label(&id);
                         app.status_message = Some(format!("{label}: {display}"));
+                        // A progress-first agent (its AgentSpawned was dropped
+                        // under channel pressure) exists only in agent_progress
+                        // until a ListSubAgents refresh promotes it into
+                        // subagent_cache. Request that refresh like the
+                        // AgentSpawned arm does, so the sidebar row survives
+                        // reconciliation instead of flickering out.
+                        if !app.subagent_cache.iter().any(|agent| agent.agent_id == id) {
+                            subagent_list_refresh_requested = true;
+                        }
                         // #3033: Throttle redraws from rapid AgentProgress events.
                         // When 4+ sub-agents are running concurrently, each firing
                         // progress events, the per-event `needs_redraw = true` saturates
