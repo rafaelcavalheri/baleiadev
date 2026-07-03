@@ -181,6 +181,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         "deepseek" => CommandResult::error(
             "The /deepseek command was renamed. Use /links (aliases: /dashboard, /api).",
         ),
+        "doctor" => CommandResult::error(
+            "The /doctor command is a CLI diagnostic. Run `codewhale doctor` or `codewhale doctor --json`; use `/setup` in the TUI for readiness and verification.",
+        ),
 
         _ => {
             // Third source: skills (lowest precedence after native and user-config).

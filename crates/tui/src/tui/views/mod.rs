@@ -543,6 +543,9 @@ pub enum ViewEvent {
     },
     PlanPromptDismissed,
     SubAgentsRefresh,
+    SidebarAgentCancel {
+        agent_id: String,
+    },
     /// Emitted by the file picker (`Ctrl+P`) when the user presses Enter on a
     /// candidate. The handler should insert `@<path>` at the composer's cursor
     /// position.

@@ -104,6 +104,7 @@ use crate::tui::session_picker::SessionPickerView;
 use crate::tui::shell_job_routing::{
     add_shell_job_message, format_shell_job_list, format_shell_poll, open_shell_job_pager,
 };
+use crate::tui::streaming::StreamDisplayClock;
 use crate::tui::streaming_thinking;
 #[cfg(test)]
 use crate::tui::subagent_routing::reconcile_subagent_activity_state_at;
@@ -1800,6 +1801,7 @@ async fn run_event_loop(
 ) -> Result<()> {
     // Track streaming state
     let mut current_streaming_text = String::new();
+    let mut stream_display_clock = StreamDisplayClock::default();
     let (translation_tx, mut translation_rx) =
         tokio::sync::mpsc::unbounded_channel::<TranslationEvent>();
     let mut pending_translations = 0usize;
@@ -2088,6 +2090,7 @@ async fn run_event_loop(
                         app.streaming_state.reset();
                         app.streaming_state.start_text(0, None);
                         app.streaming_message_index = None;
+                        stream_display_clock.reset();
                     }
                     EngineEvent::MessageDelta { content, .. } => {
                         let sanitized = sanitize_stream_chunk(&content);
@@ -2101,15 +2104,10 @@ async fn run_event_loop(
                             app.flush_active_cell();
                         }
                         current_streaming_text.push_str(&sanitized);
-                        app.streaming_output_token_estimate =
-                            estimate_output_tokens_from_text(&current_streaming_text);
-                        let index = ensure_streaming_assistant_history_cell(app);
+                        ensure_streaming_assistant_history_cell(app);
                         app.streaming_state.push_content(0, &sanitized);
-                        let committed = app.streaming_state.commit_text(0);
-                        if !committed.is_empty() {
-                            append_streaming_text(app, index, &committed);
-                            transcript_batch_updated = true;
-                        }
+                        stream_display_clock.note_delta(Instant::now());
+                        received_engine_event = redraw_requested_before_event;
                     }
                     EngineEvent::MessageComplete { .. } => {
                         // #861 RC3: defensive drain of a still-active thinking
@@ -2133,9 +2131,11 @@ async fn run_event_loop(
                         let mut completed_message_index = None;
                         if let Some(index) = app.streaming_message_index.take() {
                             completed_message_index = Some(index);
+                            stream_display_clock.flush_now(Instant::now());
                             let remaining = app.streaming_state.finalize_block_text(0);
                             if !remaining.is_empty() {
                                 append_streaming_text(app, index, &remaining);
+                                accrue_streaming_token_estimate(app, &remaining);
                             }
                             if let Some(HistoryCell::Assistant { streaming, .. }) =
                                 app.history.get_mut(index)
@@ -2148,6 +2148,7 @@ async fn run_event_loop(
                             // refreshes this row only.
                             app.bump_history_cell(index);
                             transcript_batch_updated = true;
+                            stream_display_clock.reset();
                         }
 
                         let thinking = app.last_reasoning.take();
@@ -2203,6 +2204,7 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::ThinkingStarted { .. } => {
+                        stream_display_clock.reset();
                         // P2.3: thinking lives in the active cell so it groups
                         // visually with the tool calls that follow until the
                         // next assistant prose chunk flushes the group.
@@ -2225,19 +2227,13 @@ async fn run_event_loop(
                             app.reasoning_header = extract_reasoning_header(&app.reasoning_buffer);
                         }
 
-                        let entry_idx = streaming_thinking::ensure_active_entry(app);
+                        streaming_thinking::ensure_active_entry(app);
                         app.streaming_state.push_content(0, &sanitized);
-                        let committed = app.streaming_state.commit_text(0);
-                        if !committed.is_empty() {
-                            if app.translation_enabled {
-                                streaming_thinking::set_placeholder(app, entry_idx);
-                            } else {
-                                streaming_thinking::append(app, entry_idx, &committed);
-                            }
-                            transcript_batch_updated = true;
-                        }
+                        stream_display_clock.note_delta(Instant::now());
+                        received_engine_event = redraw_requested_before_event;
                     }
                     EngineEvent::ThinkingComplete { .. } => {
+                        stream_display_clock.flush_now(Instant::now());
                         if app.translation_enabled {
                             let original_thinking = app.reasoning_buffer.clone();
                             let _ = app.streaming_state.finalize_block_text(0);
@@ -2303,6 +2299,7 @@ async fn run_event_loop(
                             transcript_batch_updated = true;
                         }
                         streaming_thinking::stash_reasoning_buffer_into_last_reasoning(app);
+                        stream_display_clock.reset();
                     }
                     EngineEvent::ToolCallStarted { id, name, input } => {
                         app.pending_tool_uses
@@ -2392,6 +2389,7 @@ async fn run_event_loop(
                         app.streaming_state.reset();
                         app.streaming_message_index = None;
                         app.streaming_thinking_active_entry = None;
+                        stream_display_clock.reset();
                         let now = Instant::now();
                         app.turn_started_at = Some(now);
                         app.turn_last_activity_at = Some(now);
@@ -2463,6 +2461,7 @@ async fn run_event_loop(
                         app.pending_provider_switch = None;
                         app.offline_mode = false;
                         app.streaming_state.reset();
+                        stream_display_clock.reset();
                         if was_locally_cancelled {
                             current_streaming_text.clear();
                         }
@@ -2574,7 +2573,8 @@ async fn run_event_loop(
                         } else {
                             &app.model
                         };
-                        let turn_cost = crate::pricing::calculate_turn_cost_estimate_from_usage(
+                        let turn_cost = crate::pricing::calculate_turn_cost_estimate_for_provider(
+                            app.api_provider,
                             pricing_model,
                             &usage,
                         );
@@ -3302,22 +3302,8 @@ async fn run_event_loop(
                 .await;
             app.status_message = Some(rollback_warning);
         }
-        if let Some(index) = app.streaming_message_index {
-            let committed = app.streaming_state.commit_text(0);
-            if !committed.is_empty() {
-                append_streaming_text(app, index, &committed);
-                transcript_batch_updated = true;
-            }
-        } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
-            let committed = app.streaming_state.commit_text(0);
-            if !committed.is_empty() {
-                if app.translation_enabled {
-                    streaming_thinking::set_placeholder(app, entry_idx);
-                } else {
-                    streaming_thinking::append(app, entry_idx, &committed);
-                }
-                transcript_batch_updated = true;
-            }
+        if commit_streaming_display_tick(app, &mut stream_display_clock, Instant::now()) {
+            transcript_batch_updated = true;
         }
         if transcript_batch_updated {
             app.mark_history_updated();
@@ -3514,6 +3500,9 @@ async fn run_event_loop(
         }
         if let Some(until_draw) = draw_wait {
             poll_timeout = poll_timeout.min(until_draw);
+        }
+        if let Some(until_stream_commit) = stream_display_clock.due_in(now) {
+            poll_timeout = poll_timeout.min(until_stream_commit);
         }
         if web_config_session.is_some() {
             poll_timeout = poll_timeout.min(Duration::from_millis(WEB_CONFIG_POLL_MS));
@@ -3959,6 +3948,10 @@ async fn run_event_loop(
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('2')
                         if app.onboarding == OnboardingState::TrustDirectory =>
                     {
+                        let _ = engine_handle.send(Op::Shutdown).await;
+                        return Ok(());
+                    }
+                    KeyCode::Esc if app.onboarding == OnboardingState::TrustDirectory => {
                         let _ = engine_handle.send(Op::Shutdown).await;
                         return Ok(());
                     }
@@ -4467,6 +4460,7 @@ async fn run_event_loop(
                             engine_handle.cancel();
                             mark_active_turn_cancelled_locally(app);
                             current_streaming_text.clear();
+                            stream_display_clock.reset();
                             let prompt_restored = app.restore_last_submitted_prompt_if_empty();
                             app.status_message = Some(
                                 if prompt_restored {
@@ -4536,6 +4530,7 @@ async fn run_event_loop(
                                     engine_handle.cancel();
                                     mark_active_turn_cancelled_locally(app);
                                     current_streaming_text.clear();
+                                    stream_display_clock.reset();
                                 }
                                 app.active_allowed_tools = None;
                                 app.hunt.quarry = None;
@@ -4547,6 +4542,7 @@ async fn run_event_loop(
                                 engine_handle.cancel();
                                 mark_active_turn_cancelled_locally(app);
                                 current_streaming_text.clear();
+                                stream_display_clock.reset();
                                 app.status_message = Some("Request cancelled".to_string());
                             }
                         }
@@ -6224,6 +6220,51 @@ fn append_streaming_text(app: &mut App, index: usize, text: &str) {
     }
 }
 
+fn accrue_streaming_token_estimate(app: &mut App, visible_text: &str) {
+    if visible_text.is_empty() {
+        return;
+    }
+    app.streaming_output_token_estimate = app
+        .streaming_output_token_estimate
+        .saturating_add(estimate_output_tokens_from_text(visible_text));
+}
+
+fn commit_streaming_display_tick(
+    app: &mut App,
+    stream_display_clock: &mut StreamDisplayClock,
+    now: Instant,
+) -> bool {
+    if !stream_display_clock.take_due(now) {
+        return false;
+    }
+
+    let mut updated = false;
+    if let Some(index) = app.streaming_message_index {
+        let committed = app.streaming_state.commit_text(0);
+        if !committed.is_empty() {
+            append_streaming_text(app, index, &committed);
+            accrue_streaming_token_estimate(app, &committed);
+            updated = true;
+        }
+    } else if let Some(entry_idx) = app.streaming_thinking_active_entry {
+        let committed = app.streaming_state.commit_text(0);
+        if !committed.is_empty() {
+            if app.translation_enabled {
+                streaming_thinking::set_placeholder(app, entry_idx);
+            } else {
+                streaming_thinking::append(app, entry_idx, &committed);
+            }
+            updated = true;
+        }
+    }
+
+    if app.streaming_state.has_pending_chunker_lines(0) {
+        stream_display_clock.note_delta(now);
+    }
+
+    updated
+}
+
 fn push_assistant_message(
     app: &mut App,
     text: String,
@@ -7767,6 +7808,18 @@ async fn apply_command_result(
             AppAction::ListSubAgents => {
                 // #3802: non-blocking send — refresh op, safe to drop.
                 let _ = engine_handle.try_send(Op::ListSubAgents);
+            }
+            AppAction::CancelSubAgent { agent_id } => {
+                app.status_message = Some(format!("Cancelling {agent_id}..."));
+                if engine_handle
+                    .send(Op::CancelSubAgent {
+                        agent_id: agent_id.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    app.status_message = Some(format!("Could not cancel {agent_id}"));
+                }
             }
             AppAction::FetchModels => {
                 app.status_message = Some("Fetching models...".to_string());
@@ -10105,6 +10158,18 @@ async fn handle_view_events(
                 app.status_message = Some("Refreshing sub-agents...".to_string());
                 // #3802: non-blocking send — refresh op, safe to drop.
                 let _ = engine_handle.try_send(Op::ListSubAgents);
+            }
+            ViewEvent::SidebarAgentCancel { agent_id } => {
+                app.status_message = Some(format!("Cancelling {agent_id}..."));
+                if engine_handle
+                    .send(Op::CancelSubAgent {
+                        agent_id: agent_id.clone(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    app.status_message = Some(format!("Could not cancel {agent_id}"));
+                }
             }
             ViewEvent::FilePickerSelected { path } => {
                 // Insert `@<path>` at the composer's cursor with surrounding

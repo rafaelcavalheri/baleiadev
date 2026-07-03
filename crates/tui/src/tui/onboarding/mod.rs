@@ -323,7 +323,7 @@ mod tests {
         assert!(body.contains("/constitution"));
         assert!(body.contains("/provider"));
         assert!(body.contains("/model"));
-        assert!(body.contains("continue to setup"));
+        assert!(body.contains("open setup if it needs attention"));
         assert!(!body.contains("open the workspace"));
     }
 

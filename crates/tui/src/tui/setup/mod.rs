@@ -219,11 +219,15 @@ impl SetupRuntimeFacts {
         let provider = app.api_provider.display_name().to_string();
         let auth = if provider_ready {
             "present or local runtime".to_string()
+        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
+            "missing Codex OAuth login".to_string()
         } else {
             "missing for active provider".to_string()
         };
         let health = if provider_ready {
             "ready for first turn; live validation remains with /provider"
+        } else if app.api_provider == crate::config::ApiProvider::OpenaiCodex {
+            "run codex login or set OPENAI_CODEX_ACCESS_TOKEN before first turn"
         } else {
             "needs key or local runtime before first turn"
         }

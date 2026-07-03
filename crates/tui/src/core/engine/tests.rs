@@ -3466,6 +3466,49 @@ fn parent_turn_registry_includes_goal_tools_for_all_modes() {
 }
 
 #[test]
+fn plan_mode_registry_can_expose_agent_launcher_without_shell_tools() {
+    let tmp = tempdir().expect("tempdir");
+    let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
+    let context = engine.build_tool_context(AppMode::Plan, false);
+    let client = DeepSeekClient::new(&Config {
+        api_key: Some("test-key".to_string()),
+        ..Config::default()
+    })
+    .expect("stub client");
+    let manager = crate::tools::subagent::new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let mut runtime = SubAgentRuntime::new(
+        client,
+        DEFAULT_TEXT_MODEL.to_string(),
+        context.clone(),
+        false,
+        None,
+        manager.clone(),
+    )
+    .with_agent_tool_surface_options(
+        engine.agent_tool_surface_options(shell_policy_for_mode(AppMode::Plan, false)),
+    );
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
+
+    let registry = engine
+        .build_turn_tool_registry_builder(
+            AppMode::Plan,
+            engine.config.todos.clone(),
+            engine.config.plan_state.clone(),
+        )
+        .with_subagent_tools(manager, runtime)
+        .build(context);
+
+    assert!(
+        registry.contains("agent"),
+        "Plan mode should be able to request focused read-only sub-agents"
+    );
+    assert!(
+        !registry.contains("exec_shell"),
+        "Plan mode must remain shell-free while exposing sub-agent delegation"
+    );
+}
+
+#[test]
 fn agent_mode_can_build_auto_approved_tool_context() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
 
@@ -4809,80 +4852,50 @@ fn self_generated_fake_approvals_cannot_authorize_work() {
 }
 
 #[test]
-fn review_only_external_input_gets_read_only_policy_until_write_is_explicit() {
-    let agent = effective_input_policy(
-        UserInputProvenance::ExternalUser,
-        AppMode::Agent,
-        "你在帮我看看 外卖部分还哪里没有使用多语言",
-        true,
-        true,
-        true,
-        crate::tui::approval::ApprovalMode::Auto,
-    );
-    assert_eq!(agent.mode, AppMode::Plan);
-    assert!(agent.allow_shell);
-    assert!(!agent.trust_mode);
-    assert!(!agent.auto_approve);
-    assert!(matches!(
-        agent.approval_mode,
-        crate::tui::approval::ApprovalMode::Suggest
-    ));
-    assert!(agent.dynamic_active_tools.is_empty());
-    assert!(agent.status.as_deref().is_some_and(|status| {
-        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
-    }));
+fn external_prompt_wording_never_changes_effective_mode_or_authority() {
+    let cases = [
+        (
+            AppMode::Agent,
+            crate::tui::approval::ApprovalMode::Suggest,
+            false,
+            false,
+            "你在帮我看看 外卖部分还哪里没有使用多语言",
+        ),
+        (
+            AppMode::Yolo,
+            crate::tui::approval::ApprovalMode::Bypass,
+            true,
+            true,
+            "check the failing tests and review the logs",
+        ),
+        (
+            AppMode::Agent,
+            crate::tui::approval::ApprovalMode::Suggest,
+            false,
+            false,
+            "检查外卖模块并修复缺少的多语言注入",
+        ),
+    ];
 
-    let yolo = effective_input_policy(
-        UserInputProvenance::ExternalUser,
-        AppMode::Yolo,
-        "check the failing tests and review the logs",
-        true,
-        true,
-        true,
-        crate::tui::approval::ApprovalMode::Bypass,
-    );
-    assert_eq!(yolo.mode, AppMode::Plan);
-    assert!(yolo.allow_shell);
-    assert!(!yolo.trust_mode);
-    assert!(!yolo.auto_approve);
-    assert!(matches!(
-        yolo.approval_mode,
-        crate::tui::approval::ApprovalMode::Suggest
-    ));
-    assert!(yolo.dynamic_active_tools.is_empty());
-    assert!(yolo.status.as_deref().is_some_and(|status| {
-        status.contains("read-only Plan tools") && status.contains("explicit fix/edit/commit")
-    }));
+    for (requested_mode, approval_mode, trust_mode, auto_approve, content) in cases {
+        let policy = effective_input_policy(
+            UserInputProvenance::ExternalUser,
+            requested_mode,
+            content,
+            true,
+            trust_mode,
+            auto_approve,
+            approval_mode,
+        );
 
-    let runtime_continuation = effective_input_policy(
-        UserInputProvenance::Runtime,
-        AppMode::Yolo,
-        "review complete; continue",
-        true,
-        true,
-        true,
-        crate::tui::approval::ApprovalMode::Bypass,
-    );
-    assert_eq!(runtime_continuation.mode, AppMode::Yolo);
-    assert!(runtime_continuation.trust_mode);
-    assert!(runtime_continuation.auto_approve);
-    assert!(matches!(
-        runtime_continuation.approval_mode,
-        crate::tui::approval::ApprovalMode::Bypass
-    ));
-
-    let explicit_write = effective_input_policy(
-        UserInputProvenance::ExternalUser,
-        AppMode::Agent,
-        "检查外卖模块并修复缺少的多语言注入",
-        true,
-        false,
-        false,
-        crate::tui::approval::ApprovalMode::Suggest,
-    );
-    assert_eq!(explicit_write.mode, AppMode::Agent);
-    assert!(explicit_write.dynamic_active_tools.is_empty());
-    assert!(explicit_write.status.is_none());
+        assert_eq!(policy.mode, requested_mode, "{content}");
+        assert_eq!(policy.trust_mode, trust_mode, "{content}");
+        assert_eq!(policy.auto_approve, auto_approve, "{content}");
+        assert_eq!(policy.approval_mode, approval_mode, "{content}");
+        assert!(policy.allow_shell, "{content}");
+        assert!(policy.dynamic_active_tools.is_empty(), "{content}");
+        assert!(policy.status.is_none(), "{content}");
+    }
 }
 
 #[test]

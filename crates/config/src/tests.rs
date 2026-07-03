@@ -1591,6 +1591,83 @@ fn get_display_value_redacts_sensitive_keys() {
 }
 
 #[test]
+fn stream_chunk_timeout_display_defaults_to_900_for_flat_key() {
+    let config = ConfigToml::default();
+
+    assert_eq!(
+        config
+            .get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("900")
+    );
+}
+
+#[test]
+fn stream_chunk_timeout_display_reads_tui_table_for_flat_key() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 1200
+        "#,
+    )
+    .expect("config toml");
+
+    assert_eq!(
+        config
+            .get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("1200")
+    );
+}
+
+#[test]
+fn stream_chunk_timeout_display_supports_dotted_tui_key() {
+    let config: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 1200
+        "#,
+    )
+    .expect("config toml");
+
+    assert_eq!(
+        config
+            .get_display_value("tui.stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("1200")
+    );
+}
+
+#[test]
+fn stream_chunk_timeout_display_zero_maps_to_default_and_clamps() {
+    let zero: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 0
+        "#,
+    )
+    .expect("zero config toml");
+    assert_eq!(
+        zero.get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("900")
+    );
+
+    let high: ConfigToml = toml::from_str(
+        r#"
+        [tui]
+        stream_chunk_timeout_secs = 9999
+        "#,
+    )
+    .expect("high config toml");
+    assert_eq!(
+        high.get_display_value("stream_chunk_timeout_secs")
+            .as_deref(),
+        Some("3600")
+    );
+}
+
+#[test]
 fn config_display_redacts_nested_extra_secrets() {
     let mut config = ConfigToml::default();
     let mut profile = toml::map::Map::new();

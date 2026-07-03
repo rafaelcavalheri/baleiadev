@@ -838,10 +838,13 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
                 continue;
             }
         }
-        // URL: consume until whitespace
+        // URL: consume until whitespace, then keep trailing punctuation
+        // visible but outside the hyperlink target.
         if rest.starts_with("http://") || rest.starts_with("https://") {
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            let url = &rest[..end];
+            let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let token = &rest[..token_end];
+            let url_end = trailing_url_end(token);
+            let url = &token[..url_end];
             if osc8::enabled() {
                 out.push(InlineToken::new(
                     url.to_string(),
@@ -851,7 +854,14 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
             } else {
                 out.push(InlineToken::new(url.to_string(), link_style, None));
             }
-            rest = &rest[end..];
+            if url_end < token_end {
+                out.push(InlineToken::new(
+                    token[url_end..].to_string(),
+                    base_style,
+                    None,
+                ));
+            }
+            rest = &rest[token_end..];
             continue;
         }
         // Plain text: consume until next marker or URL; always advance at least 1 char.
@@ -860,6 +870,36 @@ fn parse_inline_spans(line: &str, base_style: Style, link_style: Style) -> Vec<I
         rest = &rest[next..];
     }
     out
+}
+
+fn trailing_url_end(candidate: &str) -> usize {
+    let mut end = candidate.len();
+    while end > 0 {
+        let remaining = &candidate[..end];
+        let Some(ch) = remaining.chars().next_back() else {
+            break;
+        };
+        let trim = matches!(ch, ',' | '.' | ';' | '!' | '\'' | '"')
+            || matches!(ch, ')' | ']' | '}' | '>')
+                && has_unmatched_closing_delimiter(remaining, ch);
+        if !trim {
+            break;
+        }
+        end -= ch.len_utf8();
+    }
+    end
+}
+
+fn has_unmatched_closing_delimiter(candidate: &str, closing: char) -> bool {
+    let opening = match closing {
+        ')' => '(',
+        ']' => '[',
+        '}' => '{',
+        '>' => '<',
+        _ => return false,
+    };
+    candidate.chars().filter(|ch| *ch == closing).count()
+        > candidate.chars().filter(|ch| *ch == opening).count()
 }
 
 /// Find the index of the next inline marker (`**`, `__`, `*`, `_`, `http`)
@@ -1521,6 +1561,32 @@ mod tests {
         assert!(
             joined.contains("\x1b]8;;https://example.com\x1b\\https://example.com\x1b]8;;\x1b\\"),
             "expected OSC 8 wrapper around URL; got {joined:?}"
+        );
+    }
+
+    #[test]
+    fn bare_http_links_exclude_surrounding_punctuation_from_osc8_target() {
+        let joined = render_with_osc8(true, "see (https://example.com/path).");
+        assert!(
+            joined.contains(
+                "\x1b]8;;https://example.com/path\x1b\\https://example.com/path\x1b]8;;\x1b\\)."
+            ),
+            "expected trailing punctuation outside OSC 8 target; got {joined:?}"
+        );
+        assert!(
+            !joined.contains("\x1b]8;;https://example.com/path)."),
+            "OSC 8 target must not include surrounding punctuation: {joined:?}"
+        );
+    }
+
+    #[test]
+    fn bare_http_links_preserve_balanced_parentheses_in_target() {
+        let url = "https://en.wikipedia.org/wiki/Function_(mathematics)";
+        let joined = render_with_osc8(true, &format!("see {url}."));
+        let expected = format!("\x1b]8;;{url}\x1b\\{url}\x1b]8;;\x1b\\.");
+        assert!(
+            joined.contains(&expected),
+            "expected balanced URL parentheses to remain linked; got {joined:?}"
         );
     }
 

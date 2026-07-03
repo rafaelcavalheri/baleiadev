@@ -1031,6 +1031,9 @@ pub struct FleetConfigToml {
 /// three recursion levels out of the box; the root worker still runs at
 /// depth 0 even when the budget is 0.
 pub const DEFAULT_SPAWN_DEPTH: u32 = 3;
+pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 900;
+pub const MIN_STREAM_CHUNK_TIMEOUT_SECS: u64 = 1;
+pub const MAX_STREAM_CHUNK_TIMEOUT_SECS: u64 = 3600;
 
 /// Hard ceiling on recursion depth for any worker/sub-agent. The default stays
 /// conservative at [`DEFAULT_SPAWN_DEPTH`], while explicit config can opt into
@@ -1657,6 +1660,9 @@ impl ConfigToml {
 
         match key {
             "provider" => Some(self.provider.as_str().to_string()),
+            "stream_chunk_timeout_secs" | "tui.stream_chunk_timeout_secs" => {
+                Some(self.stream_chunk_timeout_secs().to_string())
+            }
             "api_key" => self.api_key.clone(),
             "base_url" => self.base_url.clone(),
             "http_headers" => serialize_http_headers(&self.http_headers),
@@ -1700,6 +1706,32 @@ impl ConfigToml {
                 value
             }
         })
+    }
+
+    #[must_use]
+    pub fn stream_chunk_timeout_secs(&self) -> u64 {
+        let raw = self
+            .extras
+            .get("tui")
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("stream_chunk_timeout_secs"))
+            .and_then(toml_value_as_u64)
+            .or_else(|| {
+                self.extras
+                    .get("tui.stream_chunk_timeout_secs")
+                    .and_then(toml_value_as_u64)
+            })
+            .or_else(|| {
+                self.extras
+                    .get("stream_chunk_timeout_secs")
+                    .and_then(toml_value_as_u64)
+            })
+            .unwrap_or(DEFAULT_STREAM_CHUNK_TIMEOUT_SECS);
+        if raw == 0 {
+            DEFAULT_STREAM_CHUNK_TIMEOUT_SECS
+        } else {
+            raw.clamp(MIN_STREAM_CHUNK_TIMEOUT_SECS, MAX_STREAM_CHUNK_TIMEOUT_SECS)
+        }
     }
 
     pub fn set_value(&mut self, key: &str, value: &str) -> Result<()> {
@@ -3904,6 +3936,14 @@ pub fn is_sensitive_config_key(key: &str) -> bool {
 
 fn redact_toml_value_for_display(key: &str, value: &toml::Value) -> String {
     redact_toml_value_for_display_inner(key, false, value).to_string()
+}
+
+fn toml_value_as_u64(value: &toml::Value) -> Option<u64> {
+    match value {
+        toml::Value::Integer(value) => u64::try_from(*value).ok(),
+        toml::Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
 }
 
 fn redact_toml_value_for_display_inner(

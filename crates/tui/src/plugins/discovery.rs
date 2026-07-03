@@ -8,15 +8,35 @@ const PLUGIN_MANIFEST: &str = "plugin.toml";
 const OVERRIDES_FILE: &str = "overrides.json";
 
 pub fn default_user_plugins_dir() -> PathBuf {
-    dirs::home_dir()
-        .map(|p| p.join(".codewhale").join("plugins"))
-        .unwrap_or_else(|| PathBuf::from("/tmp/codewhale/plugins"))
+    codewhale_config::codewhale_home()
+        .map(|p| p.join("plugins"))
+        .unwrap_or_else(|_| PathBuf::from("/tmp/codewhale/plugins"))
 }
 
 /// Path of the JSON file that records `/plugin enable|disable` choices so they
 /// survive restarts.
 pub fn default_overrides_path() -> PathBuf {
     default_user_plugins_dir().join(OVERRIDES_FILE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn default_user_plugins_dir_uses_explicit_codewhale_home() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let home = tmp.path().join("codewhale-home");
+        let _home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", home.as_os_str());
+
+        assert_eq!(default_user_plugins_dir(), home.join("plugins"));
+        assert_eq!(
+            default_overrides_path(),
+            home.join("plugins").join(OVERRIDES_FILE)
+        );
+    }
 }
 
 /// Read the persisted enable/disable overrides. Missing or malformed files

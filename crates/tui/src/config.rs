@@ -3488,16 +3488,7 @@ impl Config {
             ApiProvider::Anthropic | ApiProvider::Openmodel => {
                 anyhow::bail!("{}", missing_provider_api_key_message(provider)?)
             }
-            ApiProvider::OpenaiCodex => anyhow::bail!(
-                "OpenAI Codex OAuth credentials not found.\n\
-                 \n\
-                 CodeWhale uses your existing ChatGPT/Codex login.\n\
-                 1. Run: codex login      (or use the Codex CLI to authenticate)\n\
-                 2. CodeWhale will read credentials from ~/.codex/auth.json\n\
-                 \n\
-                 Env overrides:\n\
-                   OPENAI_CODEX_ACCESS_TOKEN  or  CODEX_ACCESS_TOKEN"
-            ),
+            ApiProvider::OpenaiCodex => anyhow::bail!("{}", crate::oauth::missing_auth_message()),
             // Self-hosted deployments commonly run without auth on localhost.
             // Return an empty key and let the client omit the Authorization header.
             ApiProvider::Sglang | ApiProvider::Vllm | ApiProvider::Ollama => Ok(String::new()),

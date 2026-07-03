@@ -1457,6 +1457,33 @@ pub struct SidebarHoverState {
 
 /// Per-row metadata for sidebar detail popovers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarRowAction {
+    Command(String),
+    ToggleAgentDetails { agent_id: String },
+    CancelAgent { agent_id: String },
+}
+
+impl SidebarRowAction {
+    #[must_use]
+    pub fn as_command(&self) -> Option<&str> {
+        match self {
+            Self::Command(command) => Some(command.as_str()),
+            Self::ToggleAgentDetails { .. } | Self::CancelAgent { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_cancel_action(&self) -> bool {
+        match self {
+            Self::Command(command) => command.contains(" cancel "),
+            Self::CancelAgent { .. } => true,
+            Self::ToggleAgentDetails { .. } => false,
+        }
+    }
+}
+
+/// Per-row metadata for sidebar detail popovers.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidebarHoverRow {
     /// Absolute row position in the terminal.
     pub row_y: u16,
@@ -1472,9 +1499,9 @@ pub struct SidebarHoverRow {
     /// `shell_*` job ids route through `/jobs` (e.g. `/jobs cancel
     /// shell_abc123`); task-manager ids route through `/task` (e.g.
     /// `/task show task_abc123`).
-    pub click_action: Option<String>,
+    pub click_action: Option<SidebarRowAction>,
     /// Optional narrower stop target for rows that show an inline `[x]`.
-    pub stop_action: Option<String>,
+    pub stop_action: Option<SidebarRowAction>,
     pub stop_zone_start_col: Option<u16>,
     pub stop_zone_end_col: Option<u16>,
 }
@@ -1801,6 +1828,8 @@ pub struct App {
     pub subagent_terminal_seen_at: HashMap<String, Instant>,
     /// Last known per-agent progress text for running sub-agents.
     pub agent_progress: HashMap<String, String>,
+    /// Agent rows expanded by direct sidebar interaction.
+    pub expanded_sidebar_agents: HashSet<String>,
     /// Parent/depth metadata for live progress-only sub-agent rows.
     pub agent_progress_meta: HashMap<String, AgentProgressMeta>,
     /// In-transcript sub-agent card index by `agent_id` (issue #128).
@@ -2749,6 +2778,7 @@ impl App {
             subagent_cache: Vec::new(),
             subagent_terminal_seen_at: HashMap::new(),
             agent_progress: HashMap::new(),
+            expanded_sidebar_agents: HashSet::new(),
             agent_progress_meta: HashMap::new(),
             subagent_card_index: HashMap::new(),
             last_fanout_card_index: None,
@@ -3288,7 +3318,11 @@ impl App {
     /// is unknown or there were no cache hits.
     pub fn last_turn_cache_savings(&self) -> Option<f64> {
         let hit_tokens = self.session.last_prompt_cache_hit_tokens?;
-        let estimate = crate::pricing::calculate_cache_savings(&self.model, hit_tokens)?;
+        let estimate = crate::pricing::calculate_cache_savings_for_provider(
+            self.api_provider,
+            &self.model,
+            hit_tokens,
+        )?;
         Some(match self.cost_currency {
             crate::pricing::CostCurrency::Usd => estimate.usd,
             crate::pricing::CostCurrency::Cny if estimate.cny == 0.0 && estimate.usd > 0.0 => {
@@ -6016,6 +6050,10 @@ pub enum AppAction {
     },
     /// Send a message to the AI (normal chat mode).
     SendMessage(String),
+    /// Cancel a running sub-agent through the engine manager.
+    CancelSubAgent {
+        agent_id: String,
+    },
     /// Update the runtime goal status (`/goal pause|resume|clear|…`) without
     /// dispatching a model turn. The UI layer translates this into
     /// `Op::SetGoalStatus`.

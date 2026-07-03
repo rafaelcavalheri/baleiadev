@@ -158,6 +158,9 @@ pub enum Op {
     /// List current sub-agents and their status
     ListSubAgents,
 
+    /// Cancel a running sub-agent by id or session name.
+    CancelSubAgent { agent_id: String },
+
     /// Change the operating mode
     #[allow(dead_code)]
     ChangeMode {

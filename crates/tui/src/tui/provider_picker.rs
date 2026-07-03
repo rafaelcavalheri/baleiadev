@@ -1590,9 +1590,14 @@ impl ProviderPickerView {
 
     fn render_key_entry(&self, area: Rect, buf: &mut Buffer) {
         let row = &self.rows[self.selected_idx];
+        let codex_oauth = row.provider == ApiProvider::OpenaiCodex;
         let outer = Block::default()
             .title(Line::from(Span::styled(
-                format!(" API key — {} ", row.display_name),
+                if codex_oauth {
+                    format!(" OAuth login — {} ", row.display_name)
+                } else {
+                    format!(" API key — {} ", row.display_name)
+                },
                 Style::default()
                     .fg(palette::DEEPSEEK_SKY)
                     .add_modifier(Modifier::BOLD),
@@ -1640,10 +1645,17 @@ impl ProviderPickerView {
         ])];
         Paragraph::new(key_lines).render(layout[0], buf);
 
-        let hint = format!(
-            "Or set the {} environment variable and re-open /provider.",
-            self.env_var_for_selected_row(),
-        );
+        let hint = if codex_oauth {
+            format!(
+                "Run `codex login`, or set {} / CODEX_ACCESS_TOKEN and re-open /provider.",
+                self.env_var_for_selected_row()
+            )
+        } else {
+            format!(
+                "Or set the {} environment variable and re-open /provider.",
+                self.env_var_for_selected_row()
+            )
+        };
         Paragraph::new(Line::from(Span::styled(
             hint,
             Style::default().fg(palette::TEXT_MUTED),

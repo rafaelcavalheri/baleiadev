@@ -58,7 +58,7 @@ use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 use crate::tools::{ToolContext, ToolRegistryBuilder};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
-use crate::worker_profile::ModelRoute;
+use crate::worker_profile::{ModelRoute, WorkerRuntimeProfile};
 use crate::working_set::WorkingSet;
 
 use super::events::{Event, TurnOutcomeStatus};
@@ -1545,6 +1545,32 @@ impl Engine {
                             );
                         }
                     }
+                    Op::CancelSubAgent { agent_id } => {
+                        let result = {
+                            let mut manager = self.subagent_manager.write().await;
+                            match manager.cancel_agent(&agent_id) {
+                                Ok(_) => Ok(manager.list()),
+                                Err(err) => Err(err),
+                            }
+                        };
+                        match result {
+                            Ok(agents) => {
+                                if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents })
+                                {
+                                    tracing::debug!(
+                                        "Event channel full; dropping CancelSubAgent refresh"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                let _ =
+                                    self.tx_event
+                                        .try_send(Event::error(ErrorEnvelope::transient(format!(
+                                            "Failed to cancel sub-agent {agent_id}: {err}"
+                                        ))));
+                            }
+                        }
+                    }
                     Op::ChangeMode {
                         mode,
                         allow_shell,
@@ -2497,65 +2523,64 @@ impl Engine {
             None
         };
 
-        let mut tool_registry = match input_policy.mode {
-            AppMode::Agent | AppMode::Auto | AppMode::Yolo => {
-                if subagents_available {
-                    let runtime = if let Some(client) = self.deepseek_client.clone() {
-                        let mut rt = SubAgentRuntime::new(
-                            client,
-                            self.session.model.clone(),
-                            tool_context.clone(),
-                            self.session.allow_shell,
-                            Some(self.tx_event.clone()),
-                            Arc::clone(&self.subagent_manager),
-                        )
-                        .with_role_models(self.config.subagent_model_overrides.clone())
-                        .with_auto_model(self.session.auto_model)
-                        .with_reasoning_effort(
-                            self.session.reasoning_effort.clone(),
-                            self.session.reasoning_effort_auto,
-                        )
-                        .with_agent_tool_surface_options(self.agent_tool_surface_options(
-                            shell_policy_for_mode(AppMode::Agent, self.session.allow_shell),
-                        ))
-                        .with_max_spawn_depth(self.config.max_spawn_depth)
-                        .with_step_api_timeout(self.config.subagent_api_timeout)
-                        .with_speech_output_dir(self.config.speech_output_dir.clone())
-                        .with_mcp_pool(mcp_pool.clone())
-                        .with_todos(self.config.todos.clone())
-                        .with_parent_completion_tx(self.tx_subagent_completion.clone());
-                        if let Some(context) = fork_context_for_runtime.clone() {
-                            rt = rt.with_fork_context(context);
-                        }
-                        if let Some((mailbox, cancel_token)) = mailbox_for_runtime.as_ref() {
-                            rt = rt
-                                .with_mailbox(mailbox.clone())
-                                .with_cancel_token(cancel_token.clone());
-                        }
-                        Some(rt)
-                    } else {
-                        None
-                    };
-                    if let Some(subagent_runtime) = runtime {
-                        Some(
-                            builder
-                                .with_subagent_tools(
-                                    self.subagent_manager.clone(),
-                                    subagent_runtime,
-                                )
-                                .build(tool_context),
-                        )
-                    } else {
-                        tracing::warn!(
-                            "Sub-agents enabled but no API client available, falling back to basic tool set"
-                        );
-                        Some(builder.build(tool_context))
-                    }
-                } else {
-                    Some(builder.build(tool_context))
+        let mut tool_registry = if subagents_available {
+            let runtime = if let Some(client) = self.deepseek_client.clone() {
+                let runtime_allow_shell =
+                    self.session.allow_shell && !matches!(input_policy.mode, AppMode::Plan);
+                let runtime_shell_policy =
+                    shell_policy_for_mode(input_policy.mode, runtime_allow_shell);
+                let mut rt = SubAgentRuntime::new(
+                    client,
+                    self.session.model.clone(),
+                    tool_context.clone(),
+                    runtime_allow_shell,
+                    Some(self.tx_event.clone()),
+                    Arc::clone(&self.subagent_manager),
+                )
+                .with_role_models(self.config.subagent_model_overrides.clone())
+                .with_auto_model(self.session.auto_model)
+                .with_reasoning_effort(
+                    self.session.reasoning_effort.clone(),
+                    self.session.reasoning_effort_auto,
+                )
+                .with_agent_tool_surface_options(
+                    self.agent_tool_surface_options(runtime_shell_policy),
+                )
+                .with_max_spawn_depth(self.config.max_spawn_depth)
+                .with_step_api_timeout(self.config.subagent_api_timeout)
+                .with_speech_output_dir(self.config.speech_output_dir.clone())
+                .with_mcp_pool(mcp_pool.clone())
+                .with_todos(self.config.todos.clone())
+                .with_parent_completion_tx(self.tx_subagent_completion.clone());
+                if matches!(input_policy.mode, AppMode::Plan) {
+                    rt.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
                 }
+                if let Some(context) = fork_context_for_runtime.clone() {
+                    rt = rt.with_fork_context(context);
+                }
+                if let Some((mailbox, cancel_token)) = mailbox_for_runtime.as_ref() {
+                    rt = rt
+                        .with_mailbox(mailbox.clone())
+                        .with_cancel_token(cancel_token.clone());
+                }
+                Some(rt)
+            } else {
+                None
+            };
+            if let Some(subagent_runtime) = runtime {
+                Some(
+                    builder
+                        .with_subagent_tools(self.subagent_manager.clone(), subagent_runtime)
+                        .build(tool_context),
+                )
+            } else {
+                tracing::warn!(
+                    "Sub-agents enabled but no API client available, falling back to basic tool set"
+                );
+                Some(builder.build(tool_context))
             }
-            _ => Some(builder.build(tool_context)),
+        } else {
+            Some(builder.build(tool_context))
         };
 
         // Load plugin tools from the user's tools directory and apply any
@@ -3498,7 +3523,7 @@ struct EffectiveInputPolicy {
 fn effective_input_policy(
     provenance: UserInputProvenance,
     requested_mode: AppMode,
-    content: &str,
+    _content: &str,
     allow_shell: bool,
     trust_mode: bool,
     auto_approve: bool,
@@ -3533,21 +3558,6 @@ fn effective_input_policy(
                 provenance.as_str()
             ));
         }
-    } else if matches!(provenance, UserInputProvenance::ExternalUser)
-        && is_review_only_user_intent(content)
-    {
-        mode = AppMode::Plan;
-        trust_mode = false;
-        auto_approve = false;
-        if matches!(
-            approval_mode,
-            crate::tui::approval::ApprovalMode::Auto | crate::tui::approval::ApprovalMode::Bypass
-        ) {
-            approval_mode = crate::tui::approval::ApprovalMode::Suggest;
-        }
-        status = Some(
-            "Review/inspection request detected; using read-only Plan tools for this turn. Add an explicit fix/edit/commit instruction to allow writes.".to_string(),
-        );
     }
 
     EffectiveInputPolicy {
@@ -3568,49 +3578,6 @@ fn provenance_can_inherit_standing_auto_authority(provenance: UserInputProvenanc
             | UserInputProvenance::Runtime
             | UserInputProvenance::SubAgentHandoff
     )
-}
-
-fn is_review_only_user_intent(content: &str) -> bool {
-    let lower = content.to_ascii_lowercase();
-    let asks_to_inspect = [
-        "look",
-        "check",
-        "review",
-        "inspect",
-        "scan",
-        "audit",
-        "看看",
-        "看一下",
-        "检查",
-        "审查",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-    if !asks_to_inspect {
-        return false;
-    }
-
-    let explicit_write = [
-        "fix",
-        "change",
-        "update",
-        "implement",
-        "apply",
-        "patch",
-        "modify",
-        "edit",
-        "write",
-        "commit",
-        "修",
-        "改",
-        "补",
-        "提交",
-        "写",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-
-    !explicit_write
 }
 
 fn agent_approval_mode_for_turn(

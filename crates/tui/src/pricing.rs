@@ -10,6 +10,7 @@ use chrono::TimeZone;
 use chrono::{DateTime, Utc};
 use codewhale_config::pricing::TokenUsage;
 
+use crate::config::ApiProvider;
 use crate::models::Usage;
 
 /// Cost display currency.
@@ -297,6 +298,21 @@ pub fn calculate_turn_cost_estimate_from_usage(model: &str, usage: &Usage) -> Op
     })
 }
 
+/// Calculate cost from provider usage when the provider's billing surface is
+/// known. ChatGPT/Codex OAuth does not expose authoritative dollar pricing to
+/// this runtime, so usage is shown without fabricating a spend estimate.
+#[must_use]
+pub fn calculate_turn_cost_estimate_for_provider(
+    provider: ApiProvider,
+    model: &str,
+    usage: &Usage,
+) -> Option<CostEstimate> {
+    if provider == ApiProvider::OpenaiCodex {
+        return None;
+    }
+    calculate_turn_cost_estimate_from_usage(model, usage)
+}
+
 /// Project provider-normalized turn usage into canonical billable token
 /// classes for the shared config pricing layer (#2961).
 ///
@@ -355,6 +371,18 @@ pub fn calculate_cache_savings(model: &str, cache_hit_tokens: u32) -> Option<Cos
             })
             .unwrap_or(0.0),
     })
+}
+
+#[must_use]
+pub fn calculate_cache_savings_for_provider(
+    provider: ApiProvider,
+    model: &str,
+    cache_hit_tokens: u32,
+) -> Option<CostEstimate> {
+    if provider == ApiProvider::OpenaiCodex {
+        return None;
+    }
+    calculate_cache_savings(model, cache_hit_tokens)
 }
 
 /// Format a USD cost for compact display.
@@ -467,6 +495,27 @@ mod tests {
                 cache_read: 250,
                 cache_write: 0,
             }
+        );
+    }
+
+    #[test]
+    fn openai_codex_gpt55_cost_is_unavailable_even_with_usage() {
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            prompt_cache_hit_tokens: Some(250),
+            prompt_cache_miss_tokens: Some(750),
+            ..Default::default()
+        };
+
+        assert!(calculate_turn_cost_estimate_from_usage("gpt-5.5", &usage).is_some());
+        assert!(
+            calculate_turn_cost_estimate_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", &usage)
+                .is_none()
+        );
+        assert!(
+            calculate_cache_savings_for_provider(ApiProvider::OpenaiCodex, "gpt-5.5", 250)
+                .is_none()
         );
     }
 

@@ -7107,7 +7107,8 @@ async fn resolve_cli_auto_route(
                 .join(", ");
             bail!(
                 "model `{model}` is available from configured provider route(s): {providers}. \
-                 Pass `--provider <provider>` with `--model {model}` to choose one explicitly."
+                 Pass `--provider <provider>` with `--model {model}` to choose one explicitly. \
+                 In the TUI, use `/provider`, `/model`, or `/setup` to resolve the route before sending."
             );
         }
 
@@ -8974,6 +8975,9 @@ mod terminal_mode_tests {
         assert!(message.contains("openrouter"));
         assert!(message.contains("zai"));
         assert!(message.contains("--provider"));
+        assert!(message.contains("/provider"));
+        assert!(message.contains("/model"));
+        assert!(message.contains("/setup"));
     }
 
     #[test]

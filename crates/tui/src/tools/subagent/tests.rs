@@ -2146,6 +2146,57 @@ fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
 }
 
 #[tokio::test]
+async fn plan_parent_profile_narrows_even_implementer_child_to_read_only() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(workspace.clone());
+    runtime.context.auto_approve = true;
+    runtime.allow_shell = false;
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
+    runtime.agent_tool_surface_options.shell_policy = ShellPolicy::None;
+
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        SubAgentType::Implementer,
+        None,
+        crate::tools::todo::new_shared_todo_list(),
+        crate::tools::plan::new_shared_plan_state(),
+    );
+
+    let names = tool_names(registry.tools_for_model(&SubAgentType::Implementer));
+    assert!(names.contains("agent"), "Plan children may still delegate");
+    for name in [
+        "write_file",
+        "edit_file",
+        "apply_patch",
+        "fim_edit",
+        "exec_shell",
+        "task_shell_start",
+    ] {
+        assert!(
+            !names.contains(name),
+            "Plan parent profile must hide child capability {name}"
+        );
+    }
+
+    let err = registry
+        .execute(
+            "agent_test",
+            "write_file",
+            json!({"path": "plan-parent-write.txt", "content": "denied"}),
+        )
+        .await
+        .expect_err("Plan parent profile must block writes even for implementer children");
+    assert!(
+        err.to_string().contains("not permitted"),
+        "expected posture rejection, got: {err}"
+    );
+    assert!(!workspace.join("plan-parent-write.txt").exists());
+}
+
+#[tokio::test]
 async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parking() {
     let tmp = tempdir().expect("tempdir");
     let manager = Arc::new(RwLock::new(SubAgentManager::new(

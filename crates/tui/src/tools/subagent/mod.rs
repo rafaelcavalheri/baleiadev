@@ -6544,6 +6544,10 @@ struct SubAgentToolRegistry {
     /// decide whether `Suggest`-level tools (write/edit/patch) may run inside
     /// the child without the parent runtime being auto-approved (#1828, #1833).
     agent_type: SubAgentType,
+    /// Already-derived capability envelope for this child. This captures the
+    /// parent posture intersection, so a Plan parent can expose delegation
+    /// without accidentally granting write or shell tools to the child.
+    runtime_profile: WorkerRuntimeProfile,
     can_spawn_child: bool,
     owner_agent_id: String,
     owner_agent_name: String,
@@ -6607,6 +6611,7 @@ impl SubAgentToolRegistry {
             allowed_tools: explicit_allowed_tools,
             auto_approve: runtime.context.auto_approve,
             agent_type,
+            runtime_profile: runtime.worker_profile,
             can_spawn_child,
             owner_agent_id,
             owner_agent_name,
@@ -6637,7 +6642,17 @@ impl SubAgentToolRegistry {
             return true;
         }
         match self.registry.get(name) {
-            Some(spec) => role_posture_permits(&self.agent_type, spec.approval_requirement()),
+            Some(spec) => match spec.approval_requirement() {
+                ApprovalRequirement::Auto => true,
+                ApprovalRequirement::Suggest => {
+                    self.runtime_profile.permissions.write
+                        && role_posture_permits(&self.agent_type, ApprovalRequirement::Suggest)
+                }
+                ApprovalRequirement::Required => {
+                    matches!(self.runtime_profile.shell, ShellPolicy::Full)
+                        && role_posture_permits(&self.agent_type, ApprovalRequirement::Required)
+                }
+            },
             None => true,
         }
     }
@@ -6715,7 +6730,9 @@ impl SubAgentToolRegistry {
                     // (#1828, #1833). Read-only roles still bounce so
                     // exploration/review/planning/verifier children
                     // can't mutate the workspace behind the parent's back.
-                    if !Self::role_can_delegate_writes(&self.agent_type) {
+                    if !self.runtime_profile.permissions.write
+                        || !Self::role_can_delegate_writes(&self.agent_type)
+                    {
                         return Err(anyhow!(
                             "Tool {name} requires approval and is not delegated to {role} sub-agents; rerun the parent with auto approval or pick a write-capable role",
                             role = self.agent_type.as_str()
