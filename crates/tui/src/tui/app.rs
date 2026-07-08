@@ -3069,6 +3069,12 @@ impl App {
         if self.onboarding != OnboardingState::None {
             return;
         }
+        // Never claim "setup is ready" when auth is still missing — e.g.
+        // `--skip-onboarding` with no API key (#3985). Leave the flag unset so
+        // the tip can appear after the user finishes provider setup.
+        if self.onboarding_needs_api_key {
+            return;
+        }
         let mut settings = Settings::load().unwrap_or_default();
         if settings.feature_intro_shown {
             return;

@@ -70,6 +70,21 @@ fn feature_intro_is_silent_while_onboarding_is_in_progress() {
 }
 
 #[test]
+fn feature_intro_is_silent_when_auth_setup_is_incomplete() {
+    // --skip-onboarding with no provider key must not claim setup is ready (#3985).
+    let mut app = App::new(test_options(false), &Config::default());
+    app.onboarding = OnboardingState::None;
+    app.onboarding_needs_api_key = true;
+    let before = app.history.len();
+    app.maybe_show_feature_intro();
+    assert_eq!(
+        app.history.len(),
+        before,
+        "must not show 'setup is ready' when API key / auth is missing"
+    );
+}
+
+#[test]
 fn feature_intro_shows_once_persists_then_is_idempotent() {
     let _env_lock = lock_test_env();
     let tmp = std::env::temp_dir().join(format!("cw-feature-intro-{}", std::process::id()));
@@ -84,6 +99,8 @@ fn feature_intro_shows_once_persists_then_is_idempotent() {
 
     let mut app = App::new(test_options(false), &Config::default());
     app.onboarding = OnboardingState::None;
+    // Isolated config has no key; pin readiness so the ready-tip path is exercised.
+    app.onboarding_needs_api_key = false;
     let before = app.history.len();
 
     app.maybe_show_feature_intro();
