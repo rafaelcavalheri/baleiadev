@@ -10127,7 +10127,7 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
     for header in [
         "── Intent ──",
         "── Plan / checklist ──",
-        "── Tool timeline ──",
+        "── Turn timeline ──",
         "── Files changed ──",
         "── Diagnostics loop ──",
         "── Tests / verifier ──",
@@ -10139,7 +10139,7 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
     }
     // Intent + tool timeline + files + result are the must-have populated ones.
     assert!(body.contains("Fix the flaky login test"), "{body}");
-    assert!(body.contains("cargo test login"), "{body}");
+    assert!(body.contains("test/verifier: cargo test login"), "{body}");
     assert!(body.contains("2.4s"), "duration missing: {body}");
     assert!(body.contains("src/login.rs"), "{body}");
     assert!(
@@ -10152,6 +10152,97 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
         "{body}"
     );
     assert!(body.contains("Status: completed"), "{body}");
+}
+
+#[test]
+fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
+    let _lock = crate::test_support::lock_test_env();
+    let tmp = TempDir::new().expect("tempdir");
+    let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path());
+    let _userprofile = crate::test_support::EnvVarGuard::set("USERPROFILE", tmp.path());
+    let workspace = tmp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(workspace.join("src.rs"), "fn main() {}\n").expect("source");
+    let repo = crate::snapshot::SnapshotRepo::open_or_init(&workspace).expect("snapshot repo");
+    repo.snapshot("pre-turn:12: Fix timeline")
+        .expect("pre-turn snapshot");
+
+    let mut app = create_test_app();
+    app.workspace = workspace;
+    app.turn_counter = 12;
+    app.runtime_turn_status = Some("completed".to_string());
+    app.history = vec![
+        HistoryCell::User {
+            content: "Fix timeline evidence".to_string(),
+        },
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: Some("src.rs".to_string()),
+            output: Some("fn main() {}".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+        HistoryCell::Tool(ToolCell::PatchSummary(
+            crate::tui::history::PatchSummaryCell {
+                path: "src.rs".to_string(),
+                summary: "add timeline evidence".to_string(),
+                status: ToolStatus::Success,
+                error: None,
+            },
+        )),
+        HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: "cargo test timeline".to_string(),
+            status: ToolStatus::Success,
+            output: Some("ok".to_string()),
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: Some(1250),
+            source: ExecSource::Assistant,
+            interaction: None,
+            output_summary: None,
+        })),
+        HistoryCell::Assistant {
+            content: "Timeline evidence is visible.".to_string(),
+            streaming: false,
+        },
+    ];
+
+    let body = turn_inspector_text(&app);
+
+    assert!(
+        body.contains("1. user prompt: Fix timeline evidence"),
+        "{body}"
+    );
+    assert!(
+        body.contains("2. read/search: read · src.rs — done · actions: v raw detail"),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "3. edit: src.rs — add timeline evidence — done · actions: v raw detail, d diff"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "4. test/verifier: cargo test timeline — done · 1.2s · actions: v raw detail"
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("checkpoint: pre-turn:12: Fix timeline"),
+        "{body}"
+    );
+    assert!(
+        body.contains("actions: r restore via /restore (guarded), e export handoff"),
+        "{body}"
+    );
 }
 
 #[test]
@@ -10237,7 +10328,7 @@ fn ctrl_o_open_turn_inspector_pager_opens_turn_overview_not_single_cell() {
     assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Pager));
     let body = pop_pager_body(&mut app);
     // Turn overview markers present; NOT the single-cell "Activity:" body.
-    assert!(body.contains("── Tool timeline ──"), "{body}");
+    assert!(body.contains("── Turn timeline ──"), "{body}");
     assert!(body.contains("do the thing"), "{body}");
     assert!(
         !body.contains("Activity chunk:"),
@@ -10293,7 +10384,7 @@ fn turn_handoff_markdown_renders_compact_sections_for_active_turn() {
     for heading in [
         "## Intent",
         "## Files changed",
-        "## Commands & tools",
+        "## Turn timeline",
         "## Tests / verifier",
         "## Model route + tokens/cost",
         "## Result / status",

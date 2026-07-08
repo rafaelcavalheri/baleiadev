@@ -6,6 +6,7 @@
 //! spillover folding), the copy-cell actions, and the footer detail labels.
 //! No logic changes were made during the extraction.
 
+use crate::snapshot::SnapshotRepo;
 use crate::tui::app::App;
 use crate::tui::footer_ui::one_line_summary;
 use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
@@ -893,8 +894,8 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
     push_section(&mut out, "Plan / checklist", turn_plan_lines(app));
     push_section(
         &mut out,
-        "Tool timeline",
-        turn_tool_timeline(app, start, end),
+        "Turn timeline",
+        turn_timeline_lines(app, start, end),
     );
     push_section(
         &mut out,
@@ -970,8 +971,8 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
     );
     push_md_section(
         &mut out,
-        "Commands & tools",
-        md_bullets(turn_tool_timeline(app, start, end)),
+        "Turn timeline",
+        md_bullets(turn_timeline_lines(app, start, end)),
     );
     push_md_section(
         &mut out,
@@ -1132,26 +1133,261 @@ fn todo_status_glyph(status: &crate::tools::todo::TodoStatus) -> &'static str {
     }
 }
 
-/// Section 3 — the turn's tool calls with status and (where known) duration.
-fn turn_tool_timeline(app: &App, start: usize, end: usize) -> Vec<String> {
-    let mut lines = Vec::new();
+/// Section 3 — chronological turn timeline with compact action affordances.
+fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
+    let mut rows = Vec::new();
     for idx in start..end {
-        let Some(HistoryCell::Tool(tool)) = app.cell_at_virtual_index(idx) else {
+        let Some(cell) = app.cell_at_virtual_index(idx) else {
             continue;
         };
-        let label = detail_target_label(app, idx).unwrap_or_else(|| "tool".to_string());
-        let mut line = format!("• {}", truncate_line_to_width(&label, 64));
-        if let Some(status) = tool_status_for_activity(tool) {
-            line.push_str(" — ");
-            line.push_str(activity_status_label(status));
+        match cell {
+            HistoryCell::User { content } => {
+                let summary = one_line_summary(content, 96);
+                rows.push(timeline_row("user prompt", &summary, None, None, &[]));
+            }
+            HistoryCell::Thinking {
+                content,
+                streaming,
+                duration_secs,
+            } => {
+                let summary = one_line_summary(content, 88);
+                let status = streaming.then_some("running").unwrap_or("done");
+                let duration = duration_secs.map(|secs| format!("{secs:.1}s"));
+                let actions = timeline_cell_actions(app, idx, cell);
+                rows.push(timeline_row(
+                    "reasoning",
+                    &summary,
+                    Some(status),
+                    duration.as_deref(),
+                    &actions,
+                ));
+            }
+            HistoryCell::Tool(tool) => {
+                let (kind, summary) = timeline_tool_summary(app, idx, tool);
+                let duration = tool_duration_for_activity(tool).map(format_activity_duration_ms);
+                let status = tool_status_for_activity(tool).map(activity_status_label);
+                let actions = timeline_cell_actions(app, idx, cell);
+                rows.push(timeline_row(
+                    kind,
+                    &summary,
+                    status,
+                    duration.as_deref(),
+                    &actions,
+                ));
+            }
+            HistoryCell::SubAgent(_) => {
+                let summary = detail_target_label(app, idx).unwrap_or_else(|| "sub-agent".into());
+                let actions = timeline_cell_actions(app, idx, cell);
+                rows.push(timeline_row("sub-agent", &summary, None, None, &actions));
+            }
+            HistoryCell::Assistant { content, streaming } => {
+                let summary = one_line_summary(content, 96);
+                let status = streaming.then_some("streaming").unwrap_or("done");
+                rows.push(timeline_row(
+                    "assistant result",
+                    &summary,
+                    Some(status),
+                    None,
+                    &[],
+                ));
+            }
+            HistoryCell::Error { message, severity } => {
+                let summary = one_line_summary(message, 96);
+                let status = severity.to_string();
+                rows.push(timeline_row("error", &summary, Some(&status), None, &[]));
+            }
+            HistoryCell::System { content }
+            | HistoryCell::ArchivedContext {
+                summary: content, ..
+            } => {
+                let summary = one_line_summary(content, 96);
+                rows.push(timeline_row("system note", &summary, None, None, &[]));
+            }
         }
-        if let Some(ms) = tool_duration_for_activity(tool) {
-            line.push_str(" · ");
-            line.push_str(&format_activity_duration_ms(ms));
-        }
-        lines.push(line);
     }
-    lines
+    rows.push(turn_checkpoint_timeline_row(app));
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| format!("{}. {row}", idx + 1))
+        .collect()
+}
+
+fn timeline_tool_summary(app: &App, idx: usize, tool: &ToolCell) -> (&'static str, String) {
+    match tool {
+        ToolCell::Exec(exec) if command_looks_like_verifier(&exec.command) => {
+            ("test/verifier", truncate_line_to_width(&exec.command, 88))
+        }
+        ToolCell::Exec(exec) => ("shell command", truncate_line_to_width(&exec.command, 88)),
+        ToolCell::Exploring(explore) => (
+            "read/search",
+            format!(
+                "{} item{}",
+                explore.entries.len(),
+                if explore.entries.len() == 1 { "" } else { "s" }
+            ),
+        ),
+        ToolCell::PlanUpdate(_) => ("plan update", "plan/checklist changed".to_string()),
+        ToolCell::PatchSummary(patch) => {
+            let summary = one_line_summary(&patch.summary, 72);
+            if summary.is_empty() {
+                ("edit", truncate_line_to_width(&patch.path, 88))
+            } else {
+                (
+                    "edit",
+                    truncate_line_to_width(&format!("{} — {summary}", patch.path), 88),
+                )
+            }
+        }
+        ToolCell::Review(review) => {
+            let target = one_line_summary(&review.target, 88);
+            (
+                "review",
+                if target.is_empty() {
+                    "code review".to_string()
+                } else {
+                    target
+                },
+            )
+        }
+        ToolCell::DiffPreview(diff) => ("diff", truncate_line_to_width(&diff.title, 88)),
+        ToolCell::Mcp(mcp) => ("MCP tool", truncate_line_to_width(&mcp.tool, 88)),
+        ToolCell::ViewImage(image) => (
+            "image",
+            truncate_line_to_width(&image.path.display().to_string(), 88),
+        ),
+        ToolCell::WebSearch(search) => ("web search", truncate_line_to_width(&search.query, 88)),
+        ToolCell::Generic(generic) => {
+            let mut label =
+                detail_target_label(app, idx).unwrap_or_else(|| generic.name.replace('_', " "));
+            if let Some(input) = generic.input_summary.as_deref().map(str::trim)
+                && !input.is_empty()
+            {
+                label.push_str(" · ");
+                label.push_str(input);
+            }
+            (
+                generic_tool_timeline_kind(generic),
+                truncate_line_to_width(&label, 88),
+            )
+        }
+    }
+}
+
+fn generic_tool_timeline_kind(generic: &crate::tui::history::GenericToolCell) -> &'static str {
+    let name = generic.name.as_str();
+    if generic.is_diff || name.contains("diff") {
+        "diff"
+    } else if matches!(name, "read_file" | "list_files" | "glob" | "grep_files")
+        || name.contains("read")
+        || name.contains("search")
+        || name.contains("grep")
+    {
+        "read/search"
+    } else if matches!(name, "apply_patch" | "edit_file" | "write_file")
+        || name.contains("patch")
+        || name.contains("edit")
+        || name.contains("write")
+    {
+        "edit"
+    } else if name.contains("approval") {
+        "approval"
+    } else if name.contains("diagnostic") || name.contains("lsp") {
+        "diagnostics"
+    } else {
+        "tool"
+    }
+}
+
+fn timeline_cell_actions(app: &App, idx: usize, cell: &HistoryCell) -> Vec<&'static str> {
+    let mut actions = Vec::new();
+    if app.cell_has_detail_target(idx) {
+        actions.push("v raw detail");
+    }
+    match cell {
+        HistoryCell::Tool(ToolCell::DiffPreview(_)) => actions.push("d diff"),
+        HistoryCell::Tool(ToolCell::PatchSummary(_)) => actions.push("d diff"),
+        HistoryCell::Tool(ToolCell::Generic(generic)) if generic.is_diff => actions.push("d diff"),
+        _ => {}
+    }
+    actions
+}
+
+fn timeline_row(
+    kind: &str,
+    summary: &str,
+    status: Option<&str>,
+    duration: Option<&str>,
+    actions: &[&str],
+) -> String {
+    let mut line = if summary.trim().is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind}: {}", summary.trim())
+    };
+    if let Some(status) = status.filter(|s| !s.trim().is_empty()) {
+        line.push_str(" — ");
+        line.push_str(status);
+    }
+    if let Some(duration) = duration.filter(|s| !s.trim().is_empty()) {
+        line.push_str(" · ");
+        line.push_str(duration);
+    }
+    if !actions.is_empty() {
+        line.push_str(" · actions: ");
+        line.push_str(&actions.join(", "));
+    }
+    line
+}
+
+fn turn_checkpoint_timeline_row(app: &App) -> String {
+    if app.turn_counter == 0 {
+        return "checkpoint: unavailable — no numbered turn snapshot yet · action: e export handoff"
+            .to_string();
+    }
+
+    let repo = match SnapshotRepo::open_existing(&app.workspace) {
+        Ok(Some(repo)) => repo,
+        Ok(None) => {
+            return "checkpoint: unavailable — no snapshot repo found · action: e export handoff"
+                .to_string();
+        }
+        Err(err) => {
+            return format!(
+                "checkpoint: unknown — snapshot repo could not be opened ({}) · action: e export handoff",
+                truncate_line_to_width(&err.to_string(), 72)
+            );
+        }
+    };
+    let snapshots = match repo.list(20) {
+        Ok(snapshots) => snapshots,
+        Err(err) => {
+            return format!(
+                "checkpoint: unknown — snapshot list failed ({}) · action: e export handoff",
+                truncate_line_to_width(&err.to_string(), 72)
+            );
+        }
+    };
+    let prefix = format!("pre-turn:{}", app.turn_counter);
+    let matching = snapshots
+        .iter()
+        .find(|snapshot| {
+            snapshot.label == prefix || snapshot.label.starts_with(&format!("{prefix}:"))
+        })
+        .or_else(|| {
+            snapshots
+                .iter()
+                .find(|snapshot| snapshot.label.starts_with("pre-turn:"))
+        });
+    if let Some(snapshot) = matching {
+        let short = &snapshot.id.as_str()[..snapshot.id.as_str().len().min(8)];
+        format!(
+            "checkpoint: {} ({short}) available · actions: r restore via /restore (guarded), e export handoff",
+            truncate_line_to_width(&snapshot.label, 72)
+        )
+    } else {
+        "checkpoint: unavailable — no pre-turn snapshot found · action: e export handoff"
+            .to_string()
+    }
 }
 
 /// Section 4 — files touched by patch/diff tool cells in the turn.
