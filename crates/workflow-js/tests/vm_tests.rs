@@ -4,7 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use codewhale_workflow_js::testing::{FakeDriver, FakeReply};
-use codewhale_workflow_js::{ProgressEvent, WORKFLOW_LIFETIME_CAP, WorkflowJsError, WorkflowVm};
+use codewhale_workflow_js::{
+    ProgressEvent, WORKFLOW_LIFETIME_CAP, WorkflowJsError, WorkflowRunCancel, WorkflowVm,
+};
 use serde_json::json;
 
 async fn run(
@@ -116,6 +118,25 @@ async fn task_accepts_prompt_and_type_aliases() {
     let request = &driver.requests()[0];
     assert_eq!(request.description, "aliased");
     assert_eq!(request.subagent_type.as_deref(), Some("verifier"));
+}
+
+#[tokio::test]
+async fn task_prompt_takes_precedence_over_short_description() {
+    let driver = Arc::new(FakeDriver::new());
+    run(
+        &driver,
+        r#"return await task({
+            description: "Short progress summary",
+            prompt: "Detailed child instructions",
+            label: "fixture-compatible"
+        });"#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    let request = &driver.requests()[0];
+    assert_eq!(request.description, "Detailed child instructions");
+    assert_eq!(request.label.as_deref(), Some("fixture-compatible"));
 }
 
 #[tokio::test]
@@ -855,6 +876,51 @@ async fn dropping_the_run_future_cancels_outstanding_tasks() {
 }
 
 #[tokio::test]
+async fn parallel_does_not_continue_after_external_run_cancellation() {
+    let driver = Arc::new(FakeDriver::new());
+    driver.on("hang", FakeReply::Never);
+    let cancel = WorkflowRunCancel::new();
+    let run_cancel = cancel.clone();
+    let run_driver = driver.clone();
+    let handle = tokio::spawn(async move {
+        WorkflowVm::new()
+            .run_script_with_cancel(
+                r#"
+                await parallel([() => task({ description: "hang" })]);
+                phase("unreachable after cancellation");
+                return "wrong";
+                "#,
+                json!(null),
+                run_driver as Arc<dyn codewhale_workflow_js::WorkflowDriver>,
+                run_cancel,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while driver.spawn_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("task should start");
+    cancel.cancel();
+
+    let result = handle.await.expect("VM task should join");
+    assert!(
+        matches!(result, Err(WorkflowJsError::Cancelled)),
+        "{result:?}"
+    );
+    assert!(
+        !driver.events().iter().any(|event| matches!(
+            event,
+            ProgressEvent::Phase { title } if title == "unreachable after cancellation"
+        )),
+        "parallel() must not downgrade run cancellation into a null slot"
+    );
+}
+
+#[tokio::test]
 async fn script_error_rejects_cleanly_and_cancels_children() {
     let driver = Arc::new(FakeDriver::new());
     let result = run(
@@ -946,4 +1012,80 @@ async fn promise_all_of_tasks_resolves_concurrently() {
         started.elapsed()
     );
     assert_eq!(driver.spawn_count(), 2);
+}
+
+#[tokio::test]
+async fn export_default_async_function_runs_with_args() {
+    let driver = Arc::new(FakeDriver::new());
+    let source = r#"
+export default async function (args) {
+  return { doubled: args.n * 2 };
+}
+"#;
+    let value = run(&driver, source, json!({ "n": 21 })).await.unwrap();
+    assert_eq!(value, json!({ "doubled": 42 }));
+}
+
+#[tokio::test]
+async fn export_default_function_result_becomes_run_result() {
+    let driver = Arc::new(FakeDriver::new());
+    let source = r#"
+function helper() {
+  return "from-helper";
+}
+export default function () {
+  return helper();
+}
+"#;
+    let value = run(&driver, source, json!(null)).await.unwrap();
+    assert_eq!(value, json!("from-helper"));
+}
+
+#[tokio::test]
+async fn export_default_non_function_value_is_returned() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(&driver, "export default 7;", json!(null))
+        .await
+        .unwrap();
+    assert_eq!(value, json!(7));
+}
+
+#[tokio::test]
+async fn plain_scripts_are_untouched_by_export_desugaring() {
+    let driver = Arc::new(FakeDriver::new());
+    // A string literal mentioning `export default` must not trigger the
+    // module desugaring path.
+    let value = run(
+        &driver,
+        "const note = \"export default docs\";\nreturn note.length;",
+        json!(null),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!(19));
+}
+
+#[tokio::test]
+async fn export_default_examples_inside_multiline_text_are_not_desugared() {
+    let driver = Arc::new(FakeDriver::new());
+    let value = run(
+        &driver,
+        r#"
+const template = `
+export default async function (args) {
+  return args;
+}
+`;
+/*
+export default function () {
+  return "comment example";
+}
+*/
+return template.includes("export default async function");
+"#,
+        json!(null),
+    )
+    .await
+    .unwrap();
+    assert_eq!(value, json!(true));
 }

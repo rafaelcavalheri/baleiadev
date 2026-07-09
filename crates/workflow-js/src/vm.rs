@@ -359,7 +359,8 @@ async fn run_in_ctx(
         .catch(&ctx)
         .map_err(|err| WorkflowJsError::VmInit(format!("prelude failed: {err}")))?;
 
-    let wrapped = format!("(async () => {{\n{source}\n}})()");
+    let desugared = desugar_export_default(&source);
+    let wrapped = format!("(async () => {{\n{desugared}\n}})()");
     let promise = ctx
         .eval::<Promise, _>(wrapped)
         .catch(&ctx)
@@ -370,6 +371,124 @@ async fn run_in_ctx(
         .catch(&ctx)
         .map_err(|err| script_error(&cancel, err))?;
     js_value_to_json(&ctx, value)
+}
+
+/// Rewrite the documented module-style authoring shape
+/// (`export default async function (args) { ... }`) into the script form the
+/// VM actually evals. Sources are wrapped in an async IIFE, where the
+/// module-only `export` keyword is a syntax error, so without this every
+/// imperative `export default` workflow (including the #4131 dogfood
+/// fixtures) failed to parse. The default export is captured, invoked with
+/// the `args` global when it is a function, and its result becomes the run
+/// result; a non-function default export is returned as-is.
+fn desugar_export_default(source: &str) -> String {
+    const EXPORT_DEFAULT: &str = "export default";
+    let Some(offset) = line_leading_export_default(source) else {
+        return source.to_string();
+    };
+    let mut out = source.to_string();
+    out.replace_range(
+        offset..offset + EXPORT_DEFAULT.len(),
+        "globalThis.__workflow_default =",
+    );
+    out.push('\n');
+    out.push_str(
+        ";{\n  const __wf_default = globalThis.__workflow_default;\n  delete globalThis.__workflow_default;\n  if (typeof __wf_default === \"function\") {\n    return await __wf_default(args);\n  }\n  if (__wf_default !== undefined) {\n    return __wf_default;\n  }\n}\n",
+    );
+    out
+}
+
+/// Return the byte offset of a line-leading `export default` token that is
+/// actual JavaScript syntax, not text inside a string, template literal, or
+/// comment. This intentionally recognizes only the documented authoring shape
+/// instead of attempting to implement a general JavaScript module parser.
+fn line_leading_export_default(source: &str) -> Option<usize> {
+    const EXPORT_DEFAULT: &[u8] = b"export default";
+    let bytes = source.as_bytes();
+    let mut idx = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut line_comment = false;
+    let mut block_comment = false;
+    let mut line_has_only_whitespace = true;
+
+    while idx < bytes.len() {
+        let byte = bytes[idx];
+
+        if line_comment {
+            if byte == b'\n' {
+                line_comment = false;
+                line_has_only_whitespace = true;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if block_comment {
+            if byte == b'*' && bytes.get(idx + 1) == Some(&b'/') {
+                block_comment = false;
+                line_has_only_whitespace = false;
+                idx += 2;
+                continue;
+            }
+            if byte == b'\n' {
+                line_has_only_whitespace = true;
+            } else if !byte.is_ascii_whitespace() {
+                line_has_only_whitespace = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        if let Some(active_quote) = quote {
+            if byte == b'\n' {
+                line_has_only_whitespace = true;
+                escaped = false;
+            } else {
+                if !byte.is_ascii_whitespace() {
+                    line_has_only_whitespace = false;
+                }
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == active_quote {
+                    quote = None;
+                }
+            }
+            idx += 1;
+            continue;
+        }
+
+        if byte == b'\n' {
+            line_has_only_whitespace = true;
+            idx += 1;
+            continue;
+        }
+        if line_has_only_whitespace && byte.is_ascii_whitespace() {
+            idx += 1;
+            continue;
+        }
+        if line_has_only_whitespace && bytes[idx..].starts_with(EXPORT_DEFAULT) {
+            return Some(idx);
+        }
+
+        line_has_only_whitespace = false;
+        if byte == b'/' && bytes.get(idx + 1) == Some(&b'/') {
+            line_comment = true;
+            idx += 2;
+        } else if byte == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+            block_comment = true;
+            idx += 2;
+        } else {
+            if matches!(byte, b'\'' | b'"' | b'`') {
+                quote = Some(byte);
+            }
+            idx += 1;
+        }
+    }
+
+    None
 }
 
 fn script_error(cancel: &CancelHandle, err: CaughtError<'_>) -> WorkflowJsError {
@@ -589,8 +708,8 @@ async fn task_host_inner(
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskOptions {
-    #[serde(alias = "prompt")]
     description: Option<String>,
+    prompt: Option<String>,
     #[serde(alias = "type")]
     subagent_type: Option<String>,
     /// Fleet role name (#4177). Preferred step identity field.
@@ -613,7 +732,8 @@ fn parse_task_options(opts_json: &str) -> Result<TaskRequest, String> {
     let options: TaskOptions =
         serde_json::from_str(opts_json).map_err(|err| format!("task(): invalid options: {err}"))?;
     let description = options
-        .description
+        .prompt
+        .or(options.description)
         .filter(|description| !description.trim().is_empty())
         .ok_or_else(|| "task(): 'description' (or 'prompt') is required".to_string())?;
     let role = options
@@ -677,7 +797,11 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
   const hostBudgetRemaining = __workflow_budget_remaining;
 
   const MAX_ITEMS = __MAX_ITEMS__;
-  const isResponseSchemaError = (err) => String(err && err.message !== undefined ? err.message : err).includes("responseSchema");
+  const taskErrorText = (err) => String(err && err.message !== undefined ? err.message : err);
+  const isFatalTaskError = (err) => {
+    const text = taskErrorText(err);
+    return text.includes("responseSchema") || text.includes("run cancelled");
+  };
 
   globalThis.task = async (opts) => {
     if (opts === null || typeof opts !== "object") {
@@ -700,12 +824,12 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
     return Promise.all(thunks.map((thunk) => {
       try {
         return Promise.resolve(typeof thunk === "function" ? thunk() : thunk).catch((err) => {
-          if (isResponseSchemaError(err)) throw err;
+          if (isFatalTaskError(err)) throw err;
           hostLog("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
           return null;
         });
       } catch (err) {
-        if (isResponseSchemaError(err)) return Promise.reject(err);
+        if (isFatalTaskError(err)) return Promise.reject(err);
         hostLog("parallel(): dropped a failed slot as null: " + String((err && err.message) || err));
         return null;
       }
@@ -725,7 +849,7 @@ const PRELUDE_TEMPLATE: &str = r#""use strict";
         try {
           value = await stage(value, item, index);
         } catch (err) {
-          if (isResponseSchemaError(err)) throw err;
+          if (isFatalTaskError(err)) throw err;
           hostLog("pipeline(): dropped item " + index + " as null: " + String((err && err.message) || err));
           return null;
         }
