@@ -3283,6 +3283,23 @@ async fn run_event_loop(
                     EngineEvent::WorkflowUi { run_id, event } => {
                         // #4122: live typed workflow events → panel + history card.
                         apply_workflow_ui_event(app, &run_id, &event);
+                        // #4095 residual: budget_updated is high-frequency under
+                        // multi-agent fan-out. Data is already applied; pace the
+                        // repaint like AgentProgress so the panel does not churn.
+                        let is_budget = event
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|t| t == "budget_updated");
+                        if is_budget {
+                            if workflow_budget_redraw_permitted(
+                                &mut app.last_workflow_budget_redraw,
+                                Instant::now(),
+                            ) {
+                                app.needs_redraw = true;
+                            } else {
+                                received_engine_event = redraw_requested_before_event;
+                            }
+                        }
                         transcript_batch_updated = true;
                     }
                     EngineEvent::ApprovalRequired {
@@ -6217,6 +6234,14 @@ fn agent_progress_redraw_permitted(last_redraw: &mut Option<Instant>, now: Insta
             true
         }
     }
+}
+
+/// #4095 residual: pace workflow budget-only repaints under fan-out.
+///
+/// Same 100ms floor as AgentProgress. High-signal workflow lifecycle events
+/// bypass this gate and always paint.
+fn workflow_budget_redraw_permitted(last_redraw: &mut Option<Instant>, now: Instant) -> bool {
+    agent_progress_redraw_permitted(last_redraw, now)
 }
 
 fn agent_progress_redraw_permitted_for_drain(

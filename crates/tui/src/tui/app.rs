@@ -1910,6 +1910,10 @@ pub struct App {
     /// Last time a sub-agent progress event triggered a redraw.
     /// Used to throttle redraws under high sub-agent concurrency (#3033).
     pub last_agent_progress_redraw: Option<Instant>,
+    /// Last time a workflow `budget_updated` event was allowed to request a
+    /// repaint. High-signal workflow events (task/run lifecycle) always paint;
+    /// budget-only chatter is paced under fan-out (#4095 residual).
+    pub last_workflow_budget_redraw: Option<Instant>,
     pub ui_theme: UiTheme,
     /// Active named theme. Drives the cell-level color remap in
     /// `tui::color_compat::ColorCompatBackend` so community presets
@@ -2869,6 +2873,7 @@ impl App {
             agent_counter: 0,
             agent_label_map: HashMap::new(),
             last_agent_progress_redraw: None,
+            last_workflow_budget_redraw: None,
             ui_theme,
             theme_id,
             onboarding,
@@ -4107,11 +4112,16 @@ impl App {
     }
 
     /// Apply a workflow panel event, creating the panel on first `RunStarted`.
+    ///
+    /// Returns whether this event should request an immediate repaint.
+    /// Budget-only updates always mutate panel state but leave repaint to the
+    /// caller so high-frequency fan-out budget ticks can be paced (#4095).
     pub fn apply_workflow_panel_event(
         &mut self,
         event: crate::tui::widgets::workflow_panel::WorkflowPanelEvent,
-    ) {
+    ) -> bool {
         use crate::tui::widgets::workflow_panel::{WorkflowPanel, WorkflowPanelEvent};
+        let budget_only = matches!(event, WorkflowPanelEvent::BudgetUpdated { .. });
         match (&mut self.workflow_panel, &event) {
             (
                 None,
@@ -4144,7 +4154,10 @@ impl App {
                 panel.apply_event(event);
             }
         }
-        self.needs_redraw = true;
+        if !budget_only {
+            self.needs_redraw = true;
+        }
+        !budget_only
     }
 
     /// Toggle the workflow panel expand/collapse state. Returns true when a

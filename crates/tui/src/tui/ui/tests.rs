@@ -12792,6 +12792,27 @@ fn agent_progress_redraw_throttle_permits_first_and_spaced_events() {
     );
 }
 
+// ── #4095 residual: workflow budget_updated redraw throttle ────────────────
+
+#[test]
+fn workflow_budget_redraw_throttle_matches_progress_pace() {
+    let mut last_redraw = None;
+    let t0 = Instant::now();
+
+    assert!(
+        workflow_budget_redraw_permitted(&mut last_redraw, t0),
+        "first budget tick may repaint"
+    );
+    assert!(
+        !workflow_budget_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(40)),
+        "budget churn inside 100ms is coalesced"
+    );
+    assert!(
+        workflow_budget_redraw_permitted(&mut last_redraw, t0 + Duration::from_millis(120)),
+        "budget ticks past the window repaint again"
+    );
+}
+
 #[test]
 fn throttled_progress_event_does_not_cancel_other_events_redraw() {
     // Repro for the #3033 audit finding: `received_engine_event` is a shared
