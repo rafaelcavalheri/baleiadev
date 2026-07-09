@@ -1178,7 +1178,10 @@ fn test_apply_spawn_profile_unknown_lists_available_members() {
         parse_spawn_request(&json!({"prompt": "x", "profile": "warlock"})).expect("parse");
     let err = apply_spawn_profile(&mut request, &roster).expect_err("unknown profile should fail");
     let message = err.to_string();
-    assert!(message.contains("Unknown profile 'warlock'"), "{message}");
+    assert!(
+        message.contains("Unknown fleet role/profile 'warlock'"),
+        "{message}"
+    );
     for member in [
         "manager",
         "scout",
@@ -1619,10 +1622,27 @@ fn test_parse_spawn_request_rejects_text_and_items_together() {
 fn test_parse_spawn_request_rejects_invalid_role() {
     let input = json!({
         "prompt": "do work",
-        "role": "unknown_role"
+        "role": "unknown role"
     });
     let err = parse_spawn_request(&input).expect_err("invalid role should fail");
-    assert!(err.to_string().contains("Invalid role alias"));
+    assert!(
+        err.to_string()
+            .contains("role must be a bare roster member id"),
+        "{err}"
+    );
+}
+
+#[test]
+fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
+    let input = json!({
+        "prompt": "do work",
+        "role": "release_lead"
+    });
+    let parsed = parse_spawn_request(&input).expect("fleet role token should parse");
+    assert_eq!(parsed.agent_type, SubAgentType::General);
+    assert!(!parsed.agent_type_explicit);
+    assert_eq!(parsed.assignment.role.as_deref(), Some("release_lead"));
+    assert_eq!(parsed.profile.as_deref(), Some("release_lead"));
 }
 
 #[test]
@@ -1683,11 +1703,19 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
 
 #[test]
 fn test_invalid_role_error_lists_real_aliases() {
-    // The hint must enumerate the actually-accepted vocabulary (#2649).
+    // Well-formed fleet role tokens parse and then fail clearly at roster
+    // resolution time with both real roster members and type aliases (#4177).
+    let roster = FleetRoster::built_ins_only();
     let input = json!({ "prompt": "do work", "role": "nonsense" });
-    let err = parse_spawn_request(&input)
-        .expect_err("invalid role should fail")
+    let mut request = parse_spawn_request(&input).expect("fleet role token should parse");
+    let err = apply_spawn_profile(&mut request, &roster)
+        .expect_err("unknown fleet role should fail at runtime resolution")
         .to_string();
+    assert!(
+        err.contains("Unknown fleet role/profile 'nonsense'"),
+        "{err}"
+    );
+    assert!(err.contains("scout"), "hint should list scout: {err}");
     assert!(err.contains("reviewer"), "hint should list reviewer: {err}");
     assert!(err.contains("verifier"), "hint should list verifier: {err}");
     assert!(err.contains("custom"), "hint should list custom: {err}");

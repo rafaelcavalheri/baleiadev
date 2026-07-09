@@ -6374,7 +6374,7 @@ fn parse_spawn_request(input: &Value) -> Result<SpawnRequest, ToolError> {
     // the alias form (e.g. implementer) used as a roster lookup key.
     let fleet_role_token = match role_input {
         Some(raw) => {
-            let token = validate_profile_name(raw)?;
+            let token = validate_role_name(raw)?;
             Some(token)
         }
         None => None,
@@ -6527,17 +6527,25 @@ fn validate_session_name(name: &str) -> Result<String, ToolError> {
 /// whitespace, quotes, backticks, or '='), lowercased for the roster's
 /// case-insensitive lookup.
 fn validate_profile_name(value: &str) -> Result<String, ToolError> {
+    validate_roster_token(value, "profile")
+}
+
+fn validate_role_name(value: &str) -> Result<String, ToolError> {
+    validate_roster_token(value, "role")
+}
+
+fn validate_roster_token(value: &str, field: &str) -> Result<String, ToolError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(ToolError::invalid_input("profile cannot be blank"));
+        return Err(ToolError::invalid_input(format!("{field} cannot be blank")));
     }
     if !trimmed
         .chars()
         .all(|ch| ch.is_ascii_graphic() && !matches!(ch, '"' | '\'' | '`' | '='))
     {
-        return Err(ToolError::invalid_input(
-            "profile must be a bare roster member id without whitespace, quotes, backticks, or '='",
-        ));
+        return Err(ToolError::invalid_input(format!(
+            "{field} must be a bare roster member id without whitespace, quotes, backticks, or '='"
+        )));
     }
     Ok(trimmed.to_ascii_lowercase())
 }
