@@ -228,6 +228,28 @@ impl StructuredState {
     }
 }
 
+fn user_shell_turn_outcome(
+    result: &Result<ToolResult, ToolError>,
+    cancel_requested: bool,
+) -> TurnOutcomeStatus {
+    let tool_reported_cancel = result.as_ref().is_ok_and(|tool_result| {
+        tool_result
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("canceled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
+
+    if cancel_requested || tool_reported_cancel {
+        TurnOutcomeStatus::Interrupted
+    } else if result.as_ref().is_ok_and(|tool_result| tool_result.success) {
+        TurnOutcomeStatus::Completed
+    } else {
+        TurnOutcomeStatus::Failed
+    }
+}
+
 fn append_plan_field(out: &mut String, label: &str, value: Option<&str>) {
     if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
         out.push_str(&format!("- {label}: {value}\n"));
@@ -1339,11 +1361,7 @@ impl Engine {
             }));
         }
 
-        let status = if result.is_err() {
-            TurnOutcomeStatus::Failed
-        } else {
-            TurnOutcomeStatus::Completed
-        };
+        let status = user_shell_turn_outcome(&result, self.cancel_token.is_cancelled());
         let error = result.as_ref().err().map(ToString::to_string);
 
         let _ = self

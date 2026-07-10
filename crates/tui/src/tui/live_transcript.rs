@@ -167,8 +167,10 @@ impl LiveTranscriptOverlay {
             let active_rev = app.active_cell_revision;
             for (idx, cell) in active.entries().iter().enumerate() {
                 let salt = (idx as u64).wrapping_add(1);
-                // Salt mirrors the main-transcript scheme so cache keys are
-                // stable across the two overlays for the same active entry.
+                // This overlay has its own cache and `CellId::Active` already
+                // separates active entries from history. It only needs the
+                // positional salt; the main transcript additionally reserves
+                // bit 63 because active and history rows can reuse one slot.
                 let revision = active_rev
                     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
                     .wrapping_add(salt);

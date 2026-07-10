@@ -2643,6 +2643,50 @@ fn model_catalog_exposes_work_update_as_sole_progress_surface() {
     }
 }
 
+#[test]
+fn user_shell_turn_outcome_distinguishes_cancel_failure_and_success() {
+    let cancelled = Ok(
+        ToolResult::error("Command canceled; process killed.").with_metadata(json!({
+            "status": "Killed",
+            "canceled": true,
+        })),
+    );
+    assert_eq!(
+        user_shell_turn_outcome(&cancelled, false),
+        TurnOutcomeStatus::Interrupted
+    );
+
+    let cancelled_while_awaiting_approval = Err(ToolError::execution_failed(
+        "Request cancelled while awaiting approval",
+    ));
+    assert_eq!(
+        user_shell_turn_outcome(&cancelled_while_awaiting_approval, true),
+        TurnOutcomeStatus::Interrupted
+    );
+
+    let failed = Ok(ToolResult::error("Command failed (exit code: 1)"));
+    assert_eq!(
+        user_shell_turn_outcome(&failed, false),
+        TurnOutcomeStatus::Failed
+    );
+
+    let execution_error = Err(ToolError::execution_failed("shell manager unavailable"));
+    assert_eq!(
+        user_shell_turn_outcome(&execution_error, false),
+        TurnOutcomeStatus::Failed
+    );
+
+    let completed = Ok(ToolResult::success("done"));
+    assert_eq!(
+        user_shell_turn_outcome(&completed, true),
+        TurnOutcomeStatus::Interrupted
+    );
+    assert_eq!(
+        user_shell_turn_outcome(&completed, false),
+        TurnOutcomeStatus::Completed
+    );
+}
+
 #[tokio::test]
 async fn run_shell_command_op_requests_approval_and_executes_shell() {
     let (mut engine, handle) = Engine::new(EngineConfig::default(), &Config::default());

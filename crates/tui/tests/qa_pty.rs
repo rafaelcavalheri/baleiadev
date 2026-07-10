@@ -350,6 +350,77 @@ fn work_and_permission_are_visible_at_release_terminal_sizes() -> anyhow::Result
     Ok(())
 }
 
+/// A composer `!` command is a host-owned shell turn. Cancelling it must
+/// settle the transcript card instead of leaving a permanent `run running`
+/// spinner after the process has been killed.
+#[test]
+fn cancelled_bang_shell_settles_transcript_card() -> anyhow::Result<()> {
+    let _guard = qa_pty_test_lock();
+    let ws = make_sealed_workspace()?;
+    let mut h = Harness::builder(Harness::cargo_bin("codewhale-tui"))
+        .cwd(ws.workspace())
+        .clear_env()
+        .seal_home(ws.home())
+        // Match the Android/Termux release probe: `--skip-onboarding` with no
+        // provider credential leaves the bang shell as the first transcript
+        // cell, which is the cache-transition edge this regression covers.
+        .env("DEEPSEEK_API_KEY", "")
+        .env("DEEPSEEK_BASE_URL", "http://127.0.0.1:1")
+        .env("RUST_LOG", "warn")
+        .args([
+            "--workspace",
+            ws.workspace().to_str().expect("utf-8 workspace path"),
+            "--no-project-config",
+            "--skip-onboarding",
+            "--yolo",
+        ])
+        .size(32, 120)
+        .spawn()?;
+
+    h.wait_for_text(COMPOSER_READY_TEXT, BOOT_TIMEOUT)?;
+    let command = "! echo $$ > shell.pid; sleep 30 & echo $! > sleep.pid; \
+                   echo CWQA_SHELL_STARTED; wait";
+    h.send(keys::key::text(command))?;
+    h.wait_for_text("CWQA_SHELL_STARTED", KEY_TIMEOUT)?;
+    h.wait_for_idle(Duration::from_millis(150), Duration::from_secs(2))?;
+    h.send(keys::key::enter())?;
+    h.wait_for_text("run running", KEY_TIMEOUT)?;
+    let process_deadline = std::time::Instant::now() + KEY_TIMEOUT;
+    while (!ws.workspace().join("shell.pid").exists() || !ws.workspace().join("sleep.pid").exists())
+        && std::time::Instant::now() < process_deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ws.workspace().join("shell.pid").exists());
+    assert!(ws.workspace().join("sleep.pid").exists());
+
+    h.send(b"\x03")?;
+    h.wait_for_text("Request cancelled", KEY_TIMEOUT)?;
+    h.wait_for(
+        |frame| !frame.contains("run running"),
+        Duration::from_secs(5),
+    )?;
+    h.wait_for_idle(Duration::from_millis(250), Duration::from_secs(5))?;
+
+    let frame = h.frame();
+    let dump = frame.debug_dump();
+    assert!(
+        !frame.contains("run running"),
+        "cancelled bang shell stayed live in transcript:\n{dump}"
+    );
+    assert!(
+        frame.contains("run issue") || frame.contains("interrupted"),
+        "cancelled bang shell did not expose a terminal card:\n{dump}"
+    );
+    assert!(
+        !frame.contains("turn completed"),
+        "cancelled bang shell was reported as a completed turn:\n{dump}"
+    );
+
+    let _ = h.shutdown();
+    Ok(())
+}
+
 /// Regression: `/skills` should reflect the same merged discovery set as the
 /// slash menu and model-visible skills block, not just the first selected
 /// skills directory.

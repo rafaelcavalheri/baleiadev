@@ -162,16 +162,17 @@ impl ChatWidget {
         if !has_collapsed {
             let mut cell_revisions: Vec<u64> =
                 Vec::with_capacity(app.history.len() + active_entries.len());
-            cell_revisions.extend_from_slice(&app.history_revisions);
+            cell_revisions.extend(
+                app.history_revisions
+                    .iter()
+                    .copied()
+                    .map(history_entry_revision),
+            );
             if !active_entries.is_empty() {
                 let active_rev = app.active_cell_revision;
                 for i in 0..active_entries.len() {
                     let salt = (i as u64).wrapping_add(1);
-                    cell_revisions.push(
-                        active_rev
-                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                            .wrapping_add(salt),
-                    );
+                    cell_revisions.push(active_entry_revision(active_rev, salt));
                 }
             }
             // Build identity mapping: filtered index == original index.
@@ -235,7 +236,7 @@ impl ChatWidget {
                     continue;
                 }
                 filtered_cells.push(cell);
-                filtered_revs.push(app.history_revisions[idx]);
+                filtered_revs.push(history_entry_revision(app.history_revisions[idx]));
                 filtered_to_original.push(idx);
             }
 
@@ -428,19 +429,49 @@ fn tool_run_summary_revision(
 ) -> u64 {
     let mut revision = 0xA11C_EA5E_D00D_2692u64 ^ ((run.start as u64) << 32) ^ (run.count as u64);
     for idx in run.start..run.start.saturating_add(run.count) {
-        let cell_revision = revisions.get(idx).copied().unwrap_or_else(|| {
-            let active_idx = idx.saturating_sub(history_len);
-            active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
-        });
+        let cell_revision = revisions
+            .get(idx)
+            .copied()
+            .map(history_entry_revision)
+            .unwrap_or_else(|| {
+                let active_idx = idx.saturating_sub(history_len);
+                active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
+            });
         revision = revision.rotate_left(7) ^ cell_revision;
     }
-    revision
+    let extends_into_active = run.start.saturating_add(run.count) > history_len;
+    revision_in_domain(revision, extends_into_active)
+}
+
+const ACTIVE_REVISION_DOMAIN: u64 = 1 << 63;
+
+fn revision_in_domain(revision: u64, active: bool) -> u64 {
+    // The top bit is exclusively a cache-domain tag. Clearing it means raw
+    // counters that differ only by bit 63 can theoretically alias within one
+    // domain after 2^63 updates; that lifetime is acceptable, while active and
+    // committed-history keys must never alias each other.
+    let payload = revision & !ACTIVE_REVISION_DOMAIN;
+    if active {
+        ACTIVE_REVISION_DOMAIN | payload
+    } else {
+        payload
+    }
+}
+
+fn history_entry_revision(revision: u64) -> u64 {
+    revision_in_domain(revision, false)
 }
 
 fn active_entry_revision(active_rev: u64, salt: u64) -> u64 {
-    active_rev
+    // Active entries and committed history cells can occupy the same
+    // positional cache slot across `flush_active_cell`. Keep their revision
+    // domains distinct so the first active entry (`active_rev = 0`,
+    // `salt = 1`) cannot collide with the first history revision (`1`) and
+    // reuse a stale `running` render after cancellation.
+    let mixed = active_rev
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(salt)
+        .wrapping_add(salt);
+    revision_in_domain(mixed, true)
 }
 
 impl Renderable for ChatWidget {
@@ -3435,20 +3466,23 @@ fn line_spans_with_selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER, ChatWidget, ComposerWidget,
-        Renderable, SlashMenuEntry, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, build_empty_state_lines, composer_height, composer_max_height,
-        composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
+        ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
+        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
+        apply_detail_target_highlight, apply_selection_to_line, apply_send_flash,
+        build_empty_state_lines, composer_height, composer_max_height, composer_min_input_rows,
+        composer_top_padding, cursor_row_col, empty_composer_visual_rows, history_entry_revision,
         layout_input, pad_lines_to_bottom, placeholder_visual_lines, push_command_entry,
-        should_render_empty_state, slash_completion_hints, wrap_input_lines,
-        wrap_input_lines_for_mouse, wrap_text,
+        revision_in_domain, should_render_empty_state, slash_completion_hints,
+        tool_run_summary_revision, wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
     use crate::tui::active_cell::ActiveCell;
     use crate::tui::app::{App, ComposerDensity, ToolCollapseMode, TuiOptions};
-    use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::history::{
+        ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus,
+    };
     use crate::tui::scrolling::{TranscriptLineMeta, TranscriptScroll};
     use ratatui::{
         buffer::Buffer,
@@ -3498,6 +3532,39 @@ mod tests {
         text
     }
 
+    #[test]
+    fn first_active_tool_settles_when_flushed_to_history() {
+        let mut app = create_test_app();
+        app.clear_history();
+        app.next_history_revision = 1;
+        app.active_cell_revision = 0;
+
+        let mut active = ActiveCell::new();
+        active.push_tool("user_shell_1", running_user_shell_cell());
+        app.active_cell = Some(active);
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut running_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut running_buf);
+        let running = buffer_text(&running_buf, area);
+        assert!(running.contains("run running"), "{running}");
+
+        app.finalize_active_cell_as_interrupted();
+        let HistoryCell::Tool(ToolCell::Exec(exec)) = &app.history[0] else {
+            panic!("expected settled exec history cell")
+        };
+        assert_eq!(exec.status, ToolStatus::Failed);
+
+        let mut settled_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
+        let settled = buffer_text(&settled_buf, area);
+        assert!(
+            !settled.contains("run running"),
+            "flushed terminal state reused the active cache entry:\n{settled}"
+        );
+        assert!(settled.contains("run issue"), "{settled}");
+    }
+
     fn render_approval_request(
         request: &crate::tui::approval::ApprovalRequest,
         area: Rect,
@@ -3527,6 +3594,23 @@ mod tests {
             spillover_path: None,
             output_summary: None,
             is_diff: false,
+        }))
+    }
+
+    fn running_user_shell_cell() -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: "sleep 30".to_string(),
+            status: ToolStatus::Running,
+            output: None,
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: None,
+            source: ExecSource::User,
+            interaction: None,
+            output_summary: None,
         }))
     }
 
@@ -3573,6 +3657,47 @@ mod tests {
         apply_detail_target_highlight(&mut lines, 0, 4, &line_meta, &original_index_map);
 
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn tool_run_summary_revision_separates_128_entry_history_and_active_alias() {
+        let active_rev = 17;
+        let run = ToolRun {
+            start: 0,
+            count: 128,
+            tool_families: Vec::new(),
+            activity: Default::default(),
+        };
+        let history_revisions = (1..=run.count)
+            .map(|salt| active_entry_revision(active_rev, salt as u64))
+            .collect::<Vec<_>>();
+
+        let history_key =
+            tool_run_summary_revision(&run, &history_revisions, run.count, active_rev);
+        let active_key = tool_run_summary_revision(&run, &[], 0, active_rev);
+
+        // Rotating by seven over 128 entries cancels the 128 identical domain
+        // bits, reproducing the old untagged hash alias. The final domain tag
+        // must still keep the cache keys distinct.
+        assert_eq!(
+            history_key & !ACTIVE_REVISION_DOMAIN,
+            active_key & !ACTIVE_REVISION_DOMAIN,
+            "fixture must exercise the 128-entry payload alias"
+        );
+        assert_eq!(history_key & ACTIVE_REVISION_DOMAIN, 0);
+        assert_eq!(active_key & ACTIVE_REVISION_DOMAIN, ACTIVE_REVISION_DOMAIN);
+        assert_ne!(history_key, active_key);
+    }
+
+    #[test]
+    fn high_bit_raw_revision_remains_distinct_across_history_and_active_domains() {
+        let raw = ACTIVE_REVISION_DOMAIN | 0x2692;
+        let history_key = history_entry_revision(raw);
+        let active_key = revision_in_domain(raw, true);
+
+        assert_eq!(history_key, 0x2692);
+        assert_eq!(active_key, ACTIVE_REVISION_DOMAIN | 0x2692);
+        assert_ne!(history_key, active_key);
     }
 
     #[test]
@@ -3637,6 +3762,46 @@ mod tests {
             !rendered.contains("full output from list_dir"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn collapsed_slow_path_does_not_reuse_running_active_cache_after_flush() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+
+        // Force the next committed history revision to have the same raw key
+        // as active revision 0, salt 1. The prior collapsed run keeps both
+        // renders on the filtered slow path.
+        app.next_history_revision = ACTIVE_REVISION_DOMAIN | 1;
+        app.active_cell_revision = 0;
+        let mut active = ActiveCell::new();
+        active.push_tool("user_shell_slow_path", running_user_shell_cell());
+        app.active_cell = Some(active);
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut running_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut running_buf);
+        let running = buffer_text(&running_buf, area);
+        assert!(running.contains("run running"), "{running}");
+        assert_eq!(app.collapsed_cell_map, vec![0, 3]);
+
+        app.finalize_active_cell_as_interrupted();
+        assert_eq!(
+            app.history_revisions[3],
+            ACTIVE_REVISION_DOMAIN | 1,
+            "fixture must force the old raw-revision collision"
+        );
+
+        let mut settled_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
+        let settled = buffer_text(&settled_buf, area);
+        assert!(
+            !settled.contains("run running"),
+            "history cell reused the active slow-path cache entry:\n{settled}"
+        );
+        assert!(settled.contains("run issue"), "{settled}");
     }
 
     #[test]
