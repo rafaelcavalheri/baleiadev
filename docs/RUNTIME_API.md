@@ -142,7 +142,7 @@ ACP-compatible editor clients (e.g. Zed). The adapter implements:
 Prompt requests are routed through the configured CodeWhale client and current
 default model. Responses are emitted as `session/update` agent message chunks
 followed by a `session/prompt` response with `stopReason: "end_turn"` (or
-`"cancelled"`, or `"max_turns"`).
+`"cancelled"`, or `"max_turn_requests"`).
 
 ### Tool support
 

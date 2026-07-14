@@ -59,7 +59,7 @@ pub(super) fn effective_max_output_tokens(model: &str) -> u32 {
     }
 }
 
-pub(super) fn effective_max_output_tokens_for_route(
+pub(crate) fn effective_max_output_tokens_for_route(
     provider: ApiProvider,
     model: &str,
     route_limits: Option<RouteLimits>,
