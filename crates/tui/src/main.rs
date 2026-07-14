@@ -7291,7 +7291,7 @@ async fn run_interactive(
 }
 
 #[derive(Debug)]
-struct CliAutoRoute {
+pub(crate) struct CliAutoRoute {
     provider: crate::config::ApiProvider,
     model: String,
     reasoning_effort: Option<crate::tui::app::ReasoningEffort>,
@@ -7327,7 +7327,7 @@ fn normalize_cli_reasoning_effort(value: &str) -> Result<Option<String>> {
     Ok(Some(normalized.to_string()))
 }
 
-fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
+pub(crate) fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
     let mut execution_config = config.clone();
     execution_config.provider = Some(route.provider.as_str().to_string());
     execution_config
@@ -7342,7 +7342,7 @@ fn config_for_cli_route(config: &Config, route: &CliAutoRoute) -> Config {
     execution_config
 }
 
-fn resolve_cli_route_limits(
+pub(crate) fn resolve_cli_route_limits(
     config: &Config,
     provider: crate::config::ApiProvider,
     model: &str,
@@ -7352,7 +7352,7 @@ fn resolve_cli_route_limits(
         .and_then(|route| crate::route_budget::known_route_limits(route.candidate.limits))
 }
 
-async fn resolve_cli_auto_route(
+pub(crate) async fn resolve_cli_auto_route(
     config: &Config,
     model: &str,
     prompt: &str,

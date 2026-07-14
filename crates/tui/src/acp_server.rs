@@ -22,7 +22,7 @@
 //! model can keep going until it produces a final answer with no further tool
 //! calls.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -187,12 +187,17 @@ pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf)
                                 write_jsonrpc_result(
                                     &mut writer,
                                     id,
-                                    json!({ "stopReason": "max_turns" }),
+                                    json!({ "stopReason": "max_turn_requests" }),
                                 )
                                 .await?;
                             }
                         }
                         Err(err) => {
+                            // The user message was already pushed into
+                            // session history by `begin_prompt`; roll it
+                            // back so the next prompt doesn't start with two
+                            // consecutive `user` messages.
+                            server.rollback_user_message(&session_id);
                             write_jsonrpc_error(&mut writer, id, -32603, err.to_string()).await?;
                         }
                     }
@@ -706,11 +711,16 @@ struct AcpServer {
     model: String,
     default_cwd: PathBuf,
     sessions: HashMap<String, AcpSession>,
+    /// Insertion-order tracking of session ids. Used to evict the *oldest*
+    /// session (by insertion order, not arbitrary HashMap iteration) when
+    /// the session cap is reached.
+    insertion_order: VecDeque<String>,
     /// Whether the connected client accepts `terminal` tool calls, from
-    /// `initialize` params `clientCapabilities.terminal`. Defaults to `true`
-    /// (permissive) so clients that omit the field — including older ACP
-    /// clients predating tool support — keep getting a working agent
-    /// instead of silently losing shell access.
+    /// `initialize` params `clientCapabilities.terminal`. Defaults to `false`
+    /// (restrictive): clients that omit the field get no shell access. Older
+    /// ACP clients predating the `terminal` capability get a working agent
+    /// without shell, which is safe; the client can re-declare support on
+    /// reconnect or via `session/request_permission`.
     client_supports_terminal: bool,
 }
 
@@ -750,7 +760,8 @@ impl AcpServer {
             model,
             default_cwd,
             sessions: HashMap::new(),
-            client_supports_terminal: true,
+            insertion_order: VecDeque::new(),
+            client_supports_terminal: false,
         }
     }
 
@@ -795,19 +806,17 @@ impl AcpServer {
         let session_id = format!("codewhale-{}", uuid::Uuid::new_v4());
         let tool_registry = Arc::new(build_acp_tool_registry(&cwd, self.client_supports_terminal));
 
-        // Evict oldest (non-prompt) session when at capacity.
+        // Evict oldest session when at capacity.
         if self.sessions.len() >= MAX_ACP_SESSIONS {
-            // Collect keys first to avoid borrowing issues.
-            let keys: Vec<String> = self.sessions.keys().cloned().collect();
-            // Sessions are retained in insertion order via HashMap when keys
-            // are few; take the first one we encounter as a simple eviction
-            // policy. A true LRU would require a list, but the max of 64
-            // makes the HashMap iter stable enough in practice.
-            if let Some(oldest) = keys.first() {
-                self.sessions.remove(oldest);
+            // `VecDeque` preserves true insertion order; HashMap iteration
+            // does not. Pop from the front to evict the session created
+            // earliest.
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.sessions.remove(&oldest);
             }
         }
 
+        self.insertion_order.push_back(session_id.clone());
         self.sessions.insert(
             session_id.clone(),
             AcpSession {
@@ -941,14 +950,29 @@ impl AcpServer {
         })
     }
 
-    /// Replace a session's history with the full message list produced by a
-    /// completed turn (the original history plus every assistant/tool-call/
-    /// tool-result round the turn drove). Called on normal completion or
-    /// max-rounds — but NOT on cancel, which preserves the pre-turn state so
-    /// a retry starts clean.
+    /// Commit the full message list produced by a completed turn into the
+    /// session's history — the original history plus every assistant/tool-
+    /// call/tool-result round the turn drove.
+    ///
+    /// Called on **all** outcomes: normal completion, max-rounds, AND cancel.
+    /// (The caller strips dangling assistant tool_use blocks on cancel before
+    /// committing, which produces a clean partial history the next prompt can
+    /// continue from instead of leaving the pre-turn state untouched.)
     fn commit_turn_messages(&mut self, session_id: &str, messages: Vec<Message>) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.messages = messages;
+        }
+    }
+
+    /// Remove the last user message from the session history. Used to unwind
+    /// the `begin_prompt` push when the turn itself fails (e.g. provider
+    /// stream error), so the next prompt doesn't start with two consecutive
+    /// `user` messages.
+    fn rollback_user_message(&mut self, session_id: &str) {
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            if session.messages.last().map(|m| m.role.as_str()) == Some("user") {
+                session.messages.pop();
+            }
         }
     }
 
@@ -1004,10 +1028,20 @@ impl AcpServer {
                 .then_some(&project_context),
         );
 
+        // Resolve `max_tokens` through the same route-limits machinery the
+        // TUI engine uses instead of a hardcoded fallback.
+        let route_limits =
+            crate::resolve_cli_route_limits(&self.config, route.provider, &route.model);
+        let effective_max_tokens = crate::core::engine::effective_max_output_tokens_for_route(
+            route.provider,
+            &route.model,
+            route_limits,
+        );
+
         let request = MessageRequest {
             model: route.model,
             messages: messages.to_vec(),
-            max_tokens: 4096,
+            max_tokens: effective_max_tokens,
             system: Some(system),
             tools: Some(tools.clone()),
             tool_choice: if tools.is_empty() {
@@ -1901,6 +1935,9 @@ mod tests {
             "test-model".to_string(),
             PathBuf::from("/tmp"),
         );
+        // Shell access is gated on the client declaring terminal support at
+        // `initialize` time; sessions created without it omit `exec_shell`.
+        server.client_supports_terminal = true;
         let s1 = server.new_session(json!({ "cwd": "/tmp" })).unwrap();
         let s2 = server.new_session(json!({ "cwd": "/tmp" })).unwrap();
         let id1 = s1["sessionId"].as_str().unwrap();

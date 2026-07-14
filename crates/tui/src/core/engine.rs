@@ -4010,9 +4010,10 @@ pub(crate) use context::compact_tool_result_for_route;
 pub use context::context_input_budget_for_route;
 #[cfg(test)]
 use context::route_context_budget_for_provider;
+pub(crate) use context::effective_max_output_tokens_for_route;
 use context::{
     MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
-    effective_max_output_tokens_for_route, estimate_input_tokens_conservative,
+    estimate_input_tokens_conservative,
     extract_compaction_summary_prompt, is_context_length_error_message,
     route_context_budget_for_route, summarize_text,
 };
