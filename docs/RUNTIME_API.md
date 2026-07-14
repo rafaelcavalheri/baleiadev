@@ -142,7 +142,7 @@ ACP-compatible editor clients (e.g. Zed). The adapter implements:
 Prompt requests are routed through the configured CodeWhale client and current
 default model. Responses are emitted as `session/update` agent message chunks
 followed by a `session/prompt` response with `stopReason: "end_turn"` (or
-`"cancelled"`).
+`"cancelled"`, or `"max_turns"`).
 
 ### Tool support
 
@@ -176,7 +176,10 @@ and only pause while a tool call is actually executing.
 `session/cancel` aborts the turn whether it lands while the model is streaming
 or while a tool (e.g. a long-running `exec_shell` command) is executing — the
 in-flight tool's cancellation token is signalled so cancel-aware tools can shut
-down cleanly.
+down cleanly. Successfully completed tool rounds are retained in session
+history so the model does not lose context of work it already performed;
+only the in-flight round (whose tool calls may not have finished) is
+discarded.
 
 `exec_shell` is only registered when the connecting client's `initialize`
 `clientCapabilities.terminal` is not explicitly `false` (older clients that
