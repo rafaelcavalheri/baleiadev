@@ -62,7 +62,16 @@ Implemented locally:
   mid-turn gets a clear "prompt in progress" error instead of being silently
   dropped.
 
-Known limitations to state clearly:
+**Update (post-#411 submission):** ACP now exposes real tool calling — see
+`docs/RUNTIME_API.md` → "ACP stdio adapter" → "Tool support" for the current
+`read_file`/`write_file`/`edit_file`/`list_dir`/`apply_patch`/`grep_files`/
+`git_status`/`git_diff`/`exec_shell` surface, reusing the same tool registry
+`codewhale exec` and `codewhale serve --mcp` already use. The bullet below
+about "ACP does not expose shell tools, file-write tools" reflects the state
+at the time of the original registry submission and is no longer accurate;
+kept here for historical context rather than rewritten.
+
+Known limitations to state clearly (as of the original #411 submission):
 
 - The adapter is baseline ACP, not the full interactive TUI/runtime surface.
 - Streaming covers text deltas only; thinking/tool/server-tool deltas are not
@@ -72,6 +81,8 @@ Known limitations to state clearly:
 - Registry submission should be gated on a local run of the upstream registry
   auth-check before opening the external PR. That check passed locally before
   `agentclientprotocol/registry#411` was opened.
+
+Current limitations (post tool-calling support): see `docs/RUNTIME_API.md`.
 
 The submitted registry PR uses the `npx` distribution because
 `codewhale@0.8.65` is already published and the npm wrapper handles platform

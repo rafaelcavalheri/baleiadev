@@ -130,21 +130,78 @@ binary.
 ## ACP stdio adapter: `codewhale serve --acp`
 
 `codewhale serve --acp` speaks JSON-RPC 2.0 over newline-delimited stdio for
-ACP-compatible editor clients. The initial adapter implements the ACP baseline:
+ACP-compatible editor clients (e.g. Zed). The adapter implements:
 
 - `initialize`
 - `session/new`
 - `session/prompt`
 - `session/cancel`
+- `session/listProviders`, `session/currentModel`, `session/selectModel`
+- `shutdown`
 
-Prompt requests are routed through the configured DeepSeek client and current
+Prompt requests are routed through the configured CodeWhale client and current
 default model. Responses are emitted as `session/update` agent message chunks
-followed by a `session/prompt` response with `stopReason: "end_turn"`.
+followed by a `session/prompt` response with `stopReason: "end_turn"` (or
+`"cancelled"`).
 
-The adapter is intentionally conservative: it does not yet expose shell tools,
-file-write tools, checkpoint replay, or session loading through ACP. Use
-`codewhale serve --http` for the full local runtime API and `codewhale serve --mcp`
-when another client needs DeepSeek's tools as MCP tools.
+### Tool support
+
+Each ACP session gets its own tool registry, built from the same file, search,
+git, patch, and shell tools `codewhale exec` and `codewhale serve --mcp`
+already use — there is no separate ACP-only tool implementation. Supported
+tools:
+
+| Tool | What it does |
+|---|---|
+| `read_file` | Read a file's contents |
+| `write_file` | Create or overwrite a file |
+| `edit_file` | Apply a targeted find/replace edit to a file |
+| `list_dir` | List a directory's contents |
+| `apply_patch` | Apply a unified-diff patch (multi-hunk, fuzzy matching) |
+| `grep_files` / `file_search` | Search the workspace by content or filename |
+| `git_status` / `git_diff` | Inspect working-tree git state |
+| `exec_shell` | Run a shell command (also covers `mkdir`/`mv`/`rm` for directory
+  creation, rename, and delete, and is how Zed's advertised "terminal"
+  capability is fulfilled) |
+
+When the model emits a tool call, the turn driver executes it locally against
+the session's registry (the same code path as `codewhale exec`), reports
+progress to the client as `tool_call` / `tool_call_update` `session/update`
+notifications, feeds the result back to the model as a `tool_result` content
+block, and re-opens the provider stream — looping until the model produces a
+final answer with no further tool calls (capped at 50 round-trips per turn).
+Streaming continues to work throughout: text deltas are still emitted live,
+and only pause while a tool call is actually executing.
+
+`session/cancel` aborts the turn whether it lands while the model is streaming
+or while a tool (e.g. a long-running `exec_shell` command) is executing — the
+in-flight tool's cancellation token is signalled so cancel-aware tools can shut
+down cleanly.
+
+`exec_shell` is only registered when the connecting client's `initialize`
+`clientCapabilities.terminal` is not explicitly `false` (older clients that
+omit the field default to enabled, for backward compatibility). Shell commands
+run with CodeWhale's safety-heuristic command analysis disabled
+(`codewhale exec --auto`-equivalent trust), since ACP has no per-tool approval
+round-trip yet — treat an ACP session as an authorization to run commands and
+write files in the session's `cwd`.
+
+### Known limitations
+
+- No per-tool approval round-trip: tool calls execute immediately rather than
+  waiting for a client-side permission prompt.
+- Tool execution is local to the CodeWhale process rather than proxied through
+  the client's own `fs`/`terminal` capabilities (Zed's own buffers/terminal
+  panel are not used for diffing or live output — only the advertised
+  `terminal` capability is read, to gate `exec_shell`).
+- No session loading/checkpoint replay through ACP (`loadSession: false`).
+- Cancelling a turn drops the conversation record of any tool calls that ran
+  during it, but not their real filesystem/shell side effects — those already
+  happened and are not rolled back.
+
+Use `codewhale serve --http` for the full local runtime API and
+`codewhale serve --mcp` when another client needs CodeWhale's tools as MCP
+tools.
 
 ## Capability endpoint: `codewhale doctor --json`
 
