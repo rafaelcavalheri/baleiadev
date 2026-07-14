@@ -36,9 +36,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::DeepSeekClient;
 use crate::config::{ApiProvider, Config};
 use crate::llm_client::{LlmClient, StreamEventBox};
-use crate::models::{
-    ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, SystemPrompt,
-};
+use crate::models::{ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent};
 use crate::tools::{ToolContext, ToolRegistry, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 
@@ -48,6 +46,10 @@ const ACP_PROTOCOL_VERSION: u64 = 1;
 /// turn. Guards against a model that never stops calling tools; each round is
 /// one provider stream plus zero or more tool executions.
 const MAX_ACP_TOOL_ROUNDS: usize = 50;
+
+/// Maximum number of concurrent sessions kept in memory. When this limit is
+/// exceeded, the oldest session with no in-flight prompt is evicted.
+const MAX_ACP_SESSIONS: usize = 64;
 
 /// Content is streamed to the model in full (no truncation); this cap only
 /// bounds how much of a tool's output is echoed into the `tool_call_update`
@@ -156,17 +158,36 @@ pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf)
                                 .await?;
                             }
                         }
-                        Ok((PromptOutcome::Cancelled, _partial_messages)) => {
-                            // A cancelled turn does not overwrite session
-                            // history: any tool calls that already ran had
-                            // real side effects, but the conversation record
-                            // of them is dropped so a retried turn starts
-                            // clean from the last committed state.
+                        Ok((PromptOutcome::Cancelled, mut partial_messages)) => {
+                            // Strip the trailing assistant message if it
+                            // carried tool_use blocks whose execution was
+                            // interrupted — dangling tool_use blocks without
+                            // tool_result blocks confuse the model on the
+                            // next prompt. All earlier completed tool rounds
+                            // stay in history.
+                            if partial_messages.last().map(|m| m.role.as_str()) == Some("assistant")
+                            {
+                                partial_messages.pop();
+                            }
+                            server.commit_turn_messages(&session_id, partial_messages);
                             if let Some(id) = id {
                                 write_jsonrpc_result(
                                     &mut writer,
                                     id,
                                     json!({ "stopReason": "cancelled" }),
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok((PromptOutcome::MaxRounds(_text), full_messages)) => {
+                            // Max rounds reached — commit what we have
+                            // (unlike cancel, this is a normal completion).
+                            server.commit_turn_messages(&session_id, full_messages);
+                            if let Some(id) = id {
+                                write_jsonrpc_result(
+                                    &mut writer,
+                                    id,
+                                    json!({ "stopReason": "max_turns" }),
                                 )
                                 .await?;
                             }
@@ -211,6 +232,9 @@ enum PromptOutcome {
     Completed(String),
     /// A matching `session/cancel` arrived before the call finished.
     Cancelled,
+    /// The turn reached the maximum number of tool-call round-trips.
+    /// Carries whatever text the model produced in the final round.
+    MaxRounds(String),
 }
 
 /// A tool call the model requested, assembled from streamed
@@ -615,6 +639,7 @@ where
         let text = match outcome {
             PromptOutcome::Cancelled => return Ok((PromptOutcome::Cancelled, messages)),
             PromptOutcome::Completed(text) => text,
+            PromptOutcome::MaxRounds(text) => text,
         };
 
         let mut assistant_content = Vec::new();
@@ -659,9 +684,21 @@ where
         }
     }
 
-    Err(anyhow!(
-        "exceeded max tool-call rounds ({MAX_ACP_TOOL_ROUNDS}) in a single ACP prompt turn"
-    ))
+    // Max rounds reached: return the text accumulated in the final round
+    // rather than an error, so the client gets a structured completion
+    // with a clear stop reason.
+    let final_text = messages
+        .iter()
+        .rev()
+        .find(|m| m.role == "assistant")
+        .and_then(|m| {
+            m.content.iter().find_map(|b| match b {
+                ContentBlock::Text { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .unwrap_or_default();
+    Ok((PromptOutcome::MaxRounds(final_text), messages))
 }
 
 struct AcpServer {
@@ -757,6 +794,20 @@ impl AcpServer {
             .unwrap_or_else(|| self.default_cwd.clone());
         let session_id = format!("codewhale-{}", uuid::Uuid::new_v4());
         let tool_registry = Arc::new(build_acp_tool_registry(&cwd, self.client_supports_terminal));
+
+        // Evict oldest (non-prompt) session when at capacity.
+        if self.sessions.len() >= MAX_ACP_SESSIONS {
+            // Collect keys first to avoid borrowing issues.
+            let keys: Vec<String> = self.sessions.keys().cloned().collect();
+            // Sessions are retained in insertion order via HashMap when keys
+            // are few; take the first one we encounter as a simple eviction
+            // policy. A true LRU would require a list, but the max of 64
+            // makes the HashMap iter stable enough in practice.
+            if let Some(oldest) = keys.first() {
+                self.sessions.remove(oldest);
+            }
+        }
+
         self.sessions.insert(
             session_id.clone(),
             AcpSession {
@@ -892,10 +943,9 @@ impl AcpServer {
 
     /// Replace a session's history with the full message list produced by a
     /// completed turn (the original history plus every assistant/tool-call/
-    /// tool-result round the turn drove). A cancelled turn never calls this,
-    /// so cancelled output does not pollute the transcript — though any tool
-    /// calls that already executed keep their real filesystem/shell side
-    /// effects regardless.
+    /// tool-result round the turn drove). Called on normal completion or
+    /// max-rounds — but NOT on cancel, which preserves the pre-turn state so
+    /// a retry starts clean.
     fn commit_turn_messages(&mut self, session_id: &str, messages: Vec<Message>) {
         if let Some(session) = self.sessions.get_mut(session_id) {
             session.messages = messages;
@@ -939,18 +989,26 @@ impl AcpServer {
             .map(str::to_string);
 
         let tools = tool_registry.to_api_tools();
+
+        // Build the system prompt the same way the engine does: the
+        // CodeWhale constitution plus workspace-local AGENTS.md, CLAUDE.md,
+        // rules, and user custom instructions from config.
+        let project_context = crate::project_context::load_project_context(cwd);
+        let system = crate::prompts::build_system_prompt(
+            &crate::prompts::compose_prompt_with_approval_model_and_shell(
+                crate::prompts::Personality::Calm,
+                &route.model,
+            ),
+            project_context
+                .has_instructions()
+                .then_some(&project_context),
+        );
+
         let request = MessageRequest {
             model: route.model,
             messages: messages.to_vec(),
             max_tokens: 4096,
-            system: Some(SystemPrompt::Text(
-                "You are CodeWhale, a coding agent running inside an ACP-compatible editor. \
-                 You have real tools to read, write, and edit files, list directories, search \
-                 the codebase, inspect git state, and run shell commands in the user's \
-                 workspace — use them to look at real file contents and command output instead \
-                 of guessing or hallucinating. Give concise, actionable responses."
-                    .to_string(),
-            )),
+            system: Some(system),
             tools: Some(tools.clone()),
             tool_choice: if tools.is_empty() {
                 None
@@ -1005,10 +1063,16 @@ fn build_acp_tool_registry(workspace: &std::path::Path, allow_shell: bool) -> To
 /// Falls back to `"other"` for tools without an obvious category.
 fn tool_call_kind(name: &str) -> &'static str {
     match name {
-        "read_file" | "list_dir" | "grep_files" | "file_search" | "git_status" | "git_diff"
-        | "git_log" | "git_show" | "git_blame" => "read",
+        "read_file" | "list_dir" | "grep_files" | "file_search" | "git_status" | "git_diff" => {
+            "read"
+        }
         "write_file" | "edit_file" | "apply_patch" => "edit",
-        "exec_shell" => "execute",
+        "exec_shell"
+        | "exec_shell_wait"
+        | "exec_shell_interact"
+        | "exec_shell_cancel"
+        | "exec_wait"
+        | "exec_interact" => "execute",
         _ => "other",
     }
 }
@@ -1022,6 +1086,7 @@ fn tool_call_title(call: &PendingToolCall) -> String {
         .get("path")
         .or_else(|| call.input.get("command"))
         .or_else(|| call.input.get("pattern"))
+        .or_else(|| call.input.get("task_id"))
         .and_then(Value::as_str);
     match detail {
         Some(detail) => format!("{}: {}", call.name, detail),
