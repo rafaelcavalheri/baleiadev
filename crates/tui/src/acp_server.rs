@@ -1,9 +1,8 @@
 //! Minimal Agent Client Protocol stdio adapter.
 //!
-//! This intentionally starts with the ACP baseline: initialize, new session,
-//! prompt, and cancel. It keeps stdout protocol-clean for editor clients and
-//! routes prompts through the same configured DeepSeek client as one-shot CLI
-//! mode.
+//! This starts from the ACP baseline: initialize, new session, prompt, and
+//! cancel. It keeps stdout protocol-clean for editor clients and routes
+//! prompts through the same configured DeepSeek client as one-shot CLI mode.
 //!
 //! `session/prompt` streams the provider response: each text delta is emitted
 //! as a `session/update` agent_message_chunk as it arrives, instead of buffering
@@ -12,14 +11,27 @@
 //! session can interrupt the turn mid-stream (returning `stopReason: "cancelled"`)
 //! instead of being queued behind it. A single writer task is preserved so
 //! stdout stays protocol-clean.
+//!
+//! Each ACP session owns a [`crate::tools::ToolRegistry`] built from the same
+//! file/search/git/patch/shell tools the CLI `exec` agent and the MCP server
+//! adapter (`crate::mcp_server`) already use. When the model emits a tool call,
+//! the turn driver executes it locally through that registry (no duplicate
+//! filesystem/shell implementation), reports progress to the client as
+//! `tool_call` / `tool_call_update` session updates, feeds the result back as
+//! a `tool_result` content block, and re-opens the provider stream so the
+//! model can keep going until it produces a final answer with no further tool
+//! calls.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, Lines};
+use tokio_util::sync::CancellationToken;
 
 use crate::client::DeepSeekClient;
 use crate::config::{ApiProvider, Config};
@@ -27,8 +39,21 @@ use crate::llm_client::{LlmClient, StreamEventBox};
 use crate::models::{
     ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent, SystemPrompt,
 };
+use crate::tools::{ToolContext, ToolRegistry, ToolRegistryBuilder};
+use crate::worker_profile::ShellPolicy;
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
+
+/// Hard cap on LLM <-> tool round-trips within a single `session/prompt`
+/// turn. Guards against a model that never stops calling tools; each round is
+/// one provider stream plus zero or more tool executions.
+const MAX_ACP_TOOL_ROUNDS: usize = 50;
+
+/// Content is streamed to the model in full (no truncation); this cap only
+/// bounds how much of a tool's output is echoed into the `tool_call_update`
+/// notification the editor renders, so a large `read_file`/`exec_shell`
+/// result does not flood the client UI.
+const TOOL_CALL_CONTENT_PREVIEW_CHARS: usize = 4_000;
 
 pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf) -> Result<()> {
     let stdin = tokio::io::stdin();
@@ -73,8 +98,9 @@ pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf)
         let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
 
         // `session/prompt` is driven concurrently with the reader so a
-        // `session/cancel` can interrupt the in-flight provider call. Every
-        // other method is request/response and handled synchronously below.
+        // `session/cancel` can interrupt the in-flight provider call or a
+        // running tool. Every other method is request/response and handled
+        // synchronously below.
         if method == "session/prompt" {
             match server.begin_prompt(params) {
                 Ok(prepared) => {
@@ -83,43 +109,66 @@ pub async fn run_acp_server(config: Config, model: String, default_cwd: PathBuf)
                         messages,
                         cwd,
                     } = prepared;
-                    // Opening the stream borrows `&server` only briefly; the
-                    // returned `StreamEventBox` is `'static`, so it can be raced
-                    // against the reader without holding a borrow on the server,
-                    // and the main task keeps exclusive ownership of stdout.
-                    match server.open_prompt_stream(&messages, &cwd).await {
-                        Ok(stream) => {
-                            let outcome =
-                                drive_prompt_stream(stream, &session_id, &mut reader, &mut writer)
-                                    .await;
-                            match outcome {
-                                Ok(PromptOutcome::Completed(output)) => {
-                                    // Chunks were already streamed; record the full
-                                    // assistant turn in history for the next prompt.
-                                    server.finish_prompt(&session_id, &output);
-                                    if let Some(id) = id {
-                                        write_jsonrpc_result(
-                                            &mut writer,
-                                            id,
-                                            json!({ "stopReason": "end_turn" }),
-                                        )
-                                        .await?;
-                                    }
-                                }
-                                Ok(PromptOutcome::Cancelled) => {
-                                    if let Some(id) = id {
-                                        write_jsonrpc_result(
-                                            &mut writer,
-                                            id,
-                                            json!({ "stopReason": "cancelled" }),
-                                        )
-                                        .await?;
-                                    }
-                                }
-                                Err(err) => {
-                                    write_jsonrpc_error(&mut writer, id, -32603, err.to_string())
-                                        .await?;
-                                }
+                    let Some(tool_registry) = server.session_tool_registry(&session_id) else {
+                        write_jsonrpc_error(&mut writer, id, -32603, "unknown sessionId").await?;
+                        continue;
+                    };
+                    // The stream-opening closure borrows `&server` only
+                    // briefly per round; each returned `StreamEventBox` is
+                    // `'static`, so it can be raced against the reader
+                    // without holding a borrow on the server across an
+                    // await, and the main task keeps exclusive ownership of
+                    // stdout.
+                    let outcome = run_agentic_prompt_turn(
+                        &session_id,
+                        messages,
+                        &tool_registry,
+                        &mut reader,
+                        &mut writer,
+                        |msgs| {
+                            // Rebind to references before the `async move`
+                            // block: `async move` moves every path it
+                            // touches, and these are already-`Copy`
+                            // references, so only `msgs` (the per-round
+                            // owned clone) is actually moved in — `server`,
+                            // `cwd`, and `tool_registry` stay borrowed from
+                            // the enclosing scope across every call this
+                            // `FnMut` closure makes.
+                            let server = &server;
+                            let cwd = &cwd;
+                            let tool_registry = &tool_registry;
+                            async move { server.open_prompt_stream(&msgs, cwd, tool_registry).await }
+                        },
+                    )
+                    .await;
+                    match outcome {
+                        Ok((PromptOutcome::Completed(_text), full_messages)) => {
+                            // Chunks were already streamed; record the full
+                            // conversation (including any tool rounds) for
+                            // the next prompt.
+                            server.commit_turn_messages(&session_id, full_messages);
+                            if let Some(id) = id {
+                                write_jsonrpc_result(
+                                    &mut writer,
+                                    id,
+                                    json!({ "stopReason": "end_turn" }),
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok((PromptOutcome::Cancelled, _partial_messages)) => {
+                            // A cancelled turn does not overwrite session
+                            // history: any tool calls that already ran had
+                            // real side effects, but the conversation record
+                            // of them is dropped so a retried turn starts
+                            // clean from the last committed state.
+                            if let Some(id) = id {
+                                write_jsonrpc_result(
+                                    &mut writer,
+                                    id,
+                                    json!({ "stopReason": "cancelled" }),
+                                )
+                                .await?;
                             }
                         }
                         Err(err) => {
@@ -164,6 +213,57 @@ enum PromptOutcome {
     Cancelled,
 }
 
+/// A tool call the model requested, assembled from streamed
+/// `content_block_start` / `content_block_delta` / `content_block_stop`
+/// events. `parse_error` is set when the accumulated `input_json_delta`
+/// bytes did not parse as JSON — the call is still surfaced (rather than
+/// silently dropped) so the model gets a clear tool-result error instead of
+/// the turn hanging.
+#[derive(Debug, Clone)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+    input: Value,
+    parse_error: Option<String>,
+}
+
+/// Accumulates one streamed `tool_use` content block until its
+/// `content_block_stop`.
+#[derive(Debug, Default)]
+struct ToolUseAccumulator {
+    id: String,
+    name: String,
+    initial_input: Value,
+    buffer: String,
+}
+
+impl ToolUseAccumulator {
+    fn finalize(self) -> PendingToolCall {
+        if self.buffer.trim().is_empty() {
+            return PendingToolCall {
+                id: self.id,
+                name: self.name,
+                input: self.initial_input,
+                parse_error: None,
+            };
+        }
+        match serde_json::from_str(&self.buffer) {
+            Ok(input) => PendingToolCall {
+                id: self.id,
+                name: self.name,
+                input,
+                parse_error: None,
+            },
+            Err(_) => PendingToolCall {
+                id: self.id,
+                name: self.name,
+                input: json!({}),
+                parse_error: Some(self.buffer),
+            },
+        }
+    }
+}
+
 /// The text payload an ACP client should see for a given stream event, if any.
 /// ACP baseline is text-only, so thinking/tool/control events carry no chunk.
 fn stream_text_chunk(event: &StreamEvent) -> Option<&str> {
@@ -191,8 +291,9 @@ fn stream_text_chunk(event: &StreamEvent) -> Option<&str> {
 /// the single protocol-clean stdout stream.
 ///
 /// Returns [`PromptOutcome::Completed`] with the full accumulated text once the
-/// stream ends (or emits `message_stop`), so the caller can record the turn in
-/// history. A matching `session/cancel` (request or notification form) ends it
+/// stream ends (or emits `message_stop`), plus any `tool_use` blocks the model
+/// emitted during the round, so the caller can execute them and continue the
+/// turn. A matching `session/cancel` (request or notification form) ends it
 /// early with [`PromptOutcome::Cancelled`] — dropping the stream aborts the
 /// underlying provider connection. The turn is single-flight: a cancel for a
 /// different session is acknowledged and ignored; any other concurrent *request*
@@ -203,12 +304,14 @@ async fn drive_prompt_stream<R, W>(
     session_id: &str,
     reader: &mut Lines<R>,
     writer: &mut W,
-) -> Result<PromptOutcome>
+) -> Result<(PromptOutcome, Vec<PendingToolCall>)>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut accumulated = String::new();
+    let mut tool_calls: Vec<PendingToolCall> = Vec::new();
+    let mut pending_tool_uses: HashMap<u32, ToolUseAccumulator> = HashMap::new();
     // Once input closes mid-turn we stop selecting on the reader and just drain
     // the stream to completion, rather than spinning on repeated EOFs.
     let mut reader_open = true;
@@ -217,7 +320,7 @@ where
             event = stream.next() => {
                 match event {
                     // Stream exhausted without an explicit stop: turn is done.
-                    None => return Ok(PromptOutcome::Completed(accumulated)),
+                    None => return Ok((PromptOutcome::Completed(accumulated), tool_calls)),
                     Some(Ok(event)) => {
                         if let Some(text) = stream_text_chunk(&event)
                             && !text.is_empty() {
@@ -225,8 +328,35 @@ where
                                 write_session_update(writer, session_id, text.to_string()).await?;
                             }
                         match event {
+                            StreamEvent::ContentBlockStart {
+                                index,
+                                content_block: ContentBlockStart::ToolUse { id, name, input, .. },
+                            } => {
+                                pending_tool_uses.insert(
+                                    index,
+                                    ToolUseAccumulator {
+                                        id,
+                                        name,
+                                        initial_input: input,
+                                        buffer: String::new(),
+                                    },
+                                );
+                            }
+                            StreamEvent::ContentBlockDelta {
+                                index,
+                                delta: Delta::InputJsonDelta { partial_json },
+                            } => {
+                                if let Some(acc) = pending_tool_uses.get_mut(&index) {
+                                    acc.buffer.push_str(&partial_json);
+                                }
+                            }
+                            StreamEvent::ContentBlockStop { index } => {
+                                if let Some(acc) = pending_tool_uses.remove(&index) {
+                                    tool_calls.push(acc.finalize());
+                                }
+                            }
                             StreamEvent::MessageStop => {
-                                return Ok(PromptOutcome::Completed(accumulated));
+                                return Ok((PromptOutcome::Completed(accumulated), tool_calls));
                             }
                             StreamEvent::Error { error } => {
                                 return Err(anyhow!("provider stream error: {error}"));
@@ -268,7 +398,7 @@ where
                                 write_jsonrpc_result(writer, id, json!(null)).await?;
                             }
                             // Dropping `stream` on return aborts the provider call.
-                            return Ok(PromptOutcome::Cancelled);
+                            return Ok((PromptOutcome::Cancelled, tool_calls));
                         }
                         // Cancel for some other session: acknowledge, keep going.
                         if let Some(id) = id {
@@ -294,16 +424,266 @@ where
     }
 }
 
+/// Outcome of executing one batch of tool calls from a single round.
+enum ToolBatchOutcome {
+    /// Every tool call ran to completion; carries the `tool_result` messages
+    /// to append to the conversation, in call order.
+    Completed(Vec<Message>),
+    /// A matching `session/cancel` arrived while a tool was running.
+    Cancelled,
+}
+
+/// Execute `tool_calls` in order against `registry`, reporting each one to
+/// the client as `tool_call` / `tool_call_update` session updates, while
+/// racing every execution against the reader for a `session/cancel`
+/// targeting `session_id`. On cancel, the tool's [`CancellationToken`] is
+/// signalled and the in-flight call is awaited to completion (so a
+/// cancel-aware tool like `exec_shell` gets a chance to kill its child
+/// process) before returning [`ToolBatchOutcome::Cancelled`].
+async fn execute_tool_calls_with_cancellation<R, W>(
+    registry: &ToolRegistry,
+    tool_calls: Vec<PendingToolCall>,
+    session_id: &str,
+    reader: &mut Lines<R>,
+    writer: &mut W,
+) -> Result<ToolBatchOutcome>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut result_messages = Vec::with_capacity(tool_calls.len());
+    let mut reader_open = true;
+
+    for call in tool_calls {
+        write_tool_call_start(writer, session_id, &call).await?;
+
+        if let Some(parse_error) = call.parse_error.clone() {
+            let content = format!("Error: tool arguments were not valid JSON: {parse_error}");
+            write_tool_call_update(writer, session_id, &call, "failed", Some(&content)).await?;
+            result_messages.push(tool_result_message(&call.id, content, true));
+            continue;
+        }
+
+        let cancel_token = CancellationToken::new();
+        let mut turn_context = registry.context().clone();
+        turn_context.cancel_token = Some(cancel_token.clone());
+        let exec_fut =
+            registry.execute_full_with_context(&call.name, call.input.clone(), Some(&turn_context));
+        tokio::pin!(exec_fut);
+
+        let exec_result = loop {
+            tokio::select! {
+                result = &mut exec_fut => break Some(result),
+                line = reader.next_line(), if reader_open => {
+                    let line = match line? {
+                        Some(line) => line,
+                        None => {
+                            reader_open = false;
+                            continue;
+                        }
+                    };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let message: Value = match serde_json::from_str(&line) {
+                        Ok(value) => value,
+                        Err(err) => {
+                            write_jsonrpc_error(writer, None, -32700, format!("invalid json: {err}"))
+                                .await?;
+                            continue;
+                        }
+                    };
+                    let msg_id = message.get("id").cloned();
+                    match message.get("method").and_then(Value::as_str) {
+                        Some("session/cancel") => {
+                            let target = message.pointer("/params/sessionId").and_then(Value::as_str);
+                            if target.is_none() || target == Some(session_id) {
+                                if let Some(msg_id) = msg_id {
+                                    write_jsonrpc_result(writer, msg_id, json!(null)).await?;
+                                }
+                                cancel_token.cancel();
+                                // Give the tool a chance to observe the token and
+                                // wind down (e.g. kill a running child process)
+                                // before we drop it.
+                                let _ = (&mut exec_fut).await;
+                                break None;
+                            }
+                            if let Some(msg_id) = msg_id {
+                                write_jsonrpc_result(writer, msg_id, json!(null)).await?;
+                            }
+                        }
+                        _ => {
+                            if let Some(msg_id) = msg_id {
+                                write_jsonrpc_error(
+                                    writer,
+                                    Some(msg_id),
+                                    -32603,
+                                    "a session/prompt turn is already in progress",
+                                )
+                                .await?;
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        let Some(exec_result) = exec_result else {
+            return Ok(ToolBatchOutcome::Cancelled);
+        };
+
+        match exec_result {
+            Ok(tool_result) => {
+                let status = if tool_result.success {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                write_tool_call_update(
+                    writer,
+                    session_id,
+                    &call,
+                    status,
+                    Some(&tool_result.content),
+                )
+                .await?;
+                result_messages.push(tool_result_message(
+                    &call.id,
+                    tool_result.content,
+                    !tool_result.success,
+                ));
+            }
+            Err(err) => {
+                let content = format!("Error: {err}");
+                write_tool_call_update(writer, session_id, &call, "failed", Some(&content)).await?;
+                result_messages.push(tool_result_message(&call.id, content, true));
+            }
+        }
+    }
+
+    Ok(ToolBatchOutcome::Completed(result_messages))
+}
+
+fn tool_result_message(tool_use_id: &str, content: String, is_error: bool) -> Message {
+    Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.to_string(),
+            content,
+            is_error: Some(is_error),
+            content_blocks: None,
+        }],
+    }
+}
+
+/// Drive one `session/prompt` turn to completion, looping through as many
+/// LLM <-> tool round-trips as the model requests (bounded by
+/// [`MAX_ACP_TOOL_ROUNDS`]).
+///
+/// `open_stream` opens a fresh provider stream for the given message
+/// history; production callers wire it to [`AcpServer::open_prompt_stream`],
+/// while tests supply canned per-round streams so the loop can be exercised
+/// without a real provider. Returns the outcome of the final round plus the
+/// full message history (including any tool-call/tool-result rounds), which
+/// the caller commits to session history only when the turn completed
+/// normally.
+///
+/// `open_stream` takes the message history *by value* (a clone per round)
+/// rather than `&[Message]`: an `async fn`'s returned future captures the
+/// lifetime of every reference parameter, so a borrowed slice here would
+/// force `Fut` to depend on each call's borrow lifetime — which `FnMut`'s
+/// single associated `Fut` type cannot express. Taking ownership sidesteps
+/// that; production callers move the clone into an `async move` block.
+async fn run_agentic_prompt_turn<R, W, F, Fut>(
+    session_id: &str,
+    mut messages: Vec<Message>,
+    tool_registry: &ToolRegistry,
+    reader: &mut Lines<R>,
+    writer: &mut W,
+    mut open_stream: F,
+) -> Result<(PromptOutcome, Vec<Message>)>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: FnMut(Vec<Message>) -> Fut,
+    Fut: Future<Output = Result<StreamEventBox>>,
+{
+    for _round in 0..MAX_ACP_TOOL_ROUNDS {
+        let stream = open_stream(messages.clone()).await?;
+        let (outcome, tool_calls) = drive_prompt_stream(stream, session_id, reader, writer).await?;
+
+        let text = match outcome {
+            PromptOutcome::Cancelled => return Ok((PromptOutcome::Cancelled, messages)),
+            PromptOutcome::Completed(text) => text,
+        };
+
+        let mut assistant_content = Vec::new();
+        if !text.is_empty() {
+            assistant_content.push(ContentBlock::Text {
+                text: text.clone(),
+                cache_control: None,
+            });
+        }
+        for call in &tool_calls {
+            assistant_content.push(ContentBlock::ToolUse {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                input: call.input.clone(),
+                caller: None,
+            });
+        }
+        if !assistant_content.is_empty() {
+            messages.push(Message {
+                role: "assistant".to_string(),
+                content: assistant_content,
+            });
+        }
+
+        if tool_calls.is_empty() {
+            return Ok((PromptOutcome::Completed(text), messages));
+        }
+
+        match execute_tool_calls_with_cancellation(
+            tool_registry,
+            tool_calls,
+            session_id,
+            reader,
+            writer,
+        )
+        .await?
+        {
+            ToolBatchOutcome::Cancelled => return Ok((PromptOutcome::Cancelled, messages)),
+            ToolBatchOutcome::Completed(tool_result_messages) => {
+                messages.extend(tool_result_messages);
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "exceeded max tool-call rounds ({MAX_ACP_TOOL_ROUNDS}) in a single ACP prompt turn"
+    ))
+}
+
 struct AcpServer {
     config: Config,
     model: String,
     default_cwd: PathBuf,
     sessions: HashMap<String, AcpSession>,
+    /// Whether the connected client accepts `terminal` tool calls, from
+    /// `initialize` params `clientCapabilities.terminal`. Defaults to `true`
+    /// (permissive) so clients that omit the field — including older ACP
+    /// clients predating tool support — keep getting a working agent
+    /// instead of silently losing shell access.
+    client_supports_terminal: bool,
 }
 
 struct AcpSession {
     cwd: PathBuf,
     messages: Vec<Message>,
+    /// Built once per session over the session `cwd`, then reused for every
+    /// prompt turn: `to_api_tools()` memoises the serialised catalog, and
+    /// `file_read_tracker` / the shell manager need to persist across turns.
+    tool_registry: Arc<ToolRegistry>,
 }
 
 /// The `&mut self` result of validating a `session/prompt`: the user turn is
@@ -333,6 +713,7 @@ impl AcpServer {
             model,
             default_cwd,
             sessions: HashMap::new(),
+            client_supports_terminal: true,
         }
     }
 
@@ -344,10 +725,18 @@ impl AcpServer {
         params: Value,
     ) -> std::result::Result<AcpDispatch, AcpError> {
         match method {
-            "initialize" => Ok(AcpDispatch::Response(initialize_result(
-                params.get("protocolVersion").and_then(Value::as_u64),
-                &self.config,
-            ))),
+            "initialize" => {
+                if let Some(terminal) = params
+                    .pointer("/clientCapabilities/terminal")
+                    .and_then(Value::as_bool)
+                {
+                    self.client_supports_terminal = terminal;
+                }
+                Ok(AcpDispatch::Response(initialize_result(
+                    params.get("protocolVersion").and_then(Value::as_u64),
+                    &self.config,
+                )))
+            }
             "session/new" => Ok(AcpDispatch::Response(self.new_session(params)?)),
             "session/listProviders" => Ok(AcpDispatch::Response(self.list_providers())),
             "session/currentModel" => Ok(AcpDispatch::Response(self.current_model())),
@@ -367,14 +756,22 @@ impl AcpServer {
             .map(PathBuf::from)
             .unwrap_or_else(|| self.default_cwd.clone());
         let session_id = format!("codewhale-{}", uuid::Uuid::new_v4());
+        let tool_registry = Arc::new(build_acp_tool_registry(&cwd, self.client_supports_terminal));
         self.sessions.insert(
             session_id.clone(),
             AcpSession {
                 cwd,
                 messages: Vec::new(),
+                tool_registry,
             },
         );
         Ok(json!({ "sessionId": session_id }))
+    }
+
+    fn session_tool_registry(&self, session_id: &str) -> Option<Arc<ToolRegistry>> {
+        self.sessions
+            .get(session_id)
+            .map(|session| session.tool_registry.clone())
     }
 
     fn list_providers(&self) -> Value {
@@ -493,20 +890,15 @@ impl AcpServer {
         })
     }
 
-    /// Append a completed assistant turn to session history. A cancelled turn
-    /// never calls this, so cancelled output does not pollute the transcript.
-    fn finish_prompt(&mut self, session_id: &str, output: &str) {
-        if output.is_empty() {
-            return;
-        }
+    /// Replace a session's history with the full message list produced by a
+    /// completed turn (the original history plus every assistant/tool-call/
+    /// tool-result round the turn drove). A cancelled turn never calls this,
+    /// so cancelled output does not pollute the transcript — though any tool
+    /// calls that already executed keep their real filesystem/shell side
+    /// effects regardless.
+    fn commit_turn_messages(&mut self, session_id: &str, messages: Vec<Message>) {
         if let Some(session) = self.sessions.get_mut(session_id) {
-            session.messages.push(Message {
-                role: "assistant".to_string(),
-                content: vec![ContentBlock::Text {
-                    text: output.to_string(),
-                    cache_control: None,
-                }],
-            });
+            session.messages = messages;
         }
     }
 
@@ -515,11 +907,12 @@ impl AcpServer {
     /// [`StreamEventBox`] is `'static`, so the caller can race it against the
     /// reader without holding any borrow on the server. The cwd guard only needs
     /// to cover route resolution and client construction, not stream
-    /// consumption (ACP exposes no file/shell tools), so it is dropped here.
+    /// consumption, so it is dropped here.
     async fn open_prompt_stream(
         &self,
         messages: &[Message],
         cwd: &PathBuf,
+        tool_registry: &ToolRegistry,
     ) -> Result<StreamEventBox> {
         let _cwd_guard = ScopedCurrentDir::new(cwd)?;
         let last_user_text = messages
@@ -545,15 +938,25 @@ impl AcpServer {
             .and_then(|effort| effort.api_value_for_provider(execution_config.api_provider()))
             .map(str::to_string);
 
+        let tools = tool_registry.to_api_tools();
         let request = MessageRequest {
             model: route.model,
             messages: messages.to_vec(),
             max_tokens: 4096,
             system: Some(SystemPrompt::Text(
-                "You are a coding assistant inside an ACP-compatible editor. Give concise, actionable responses.".to_string(),
+                "You are CodeWhale, a coding agent running inside an ACP-compatible editor. \
+                 You have real tools to read, write, and edit files, list directories, search \
+                 the codebase, inspect git state, and run shell commands in the user's \
+                 workspace — use them to look at real file contents and command output instead \
+                 of guessing or hallucinating. Give concise, actionable responses."
+                    .to_string(),
             )),
-            tools: None,
-            tool_choice: None,
+            tools: Some(tools.clone()),
+            tool_choice: if tools.is_empty() {
+                None
+            } else {
+                Some(json!({ "type": "auto" }))
+            },
             metadata: None,
             thinking: None,
             reasoning_effort,
@@ -564,6 +967,135 @@ impl AcpServer {
 
         client.create_message_stream(request).await
     }
+}
+
+/// Build the tool registry for one ACP session, rooted at the session's
+/// `cwd`. Reuses the same builder methods the CLI `exec` agent
+/// (`crate::main::run_exec_agent`) and the MCP server adapter
+/// (`crate::mcp_server`) use — no ACP-specific tool implementations.
+///
+/// `allow_shell` gates `exec_shell`/terminal tools on the client's declared
+/// `clientCapabilities.terminal` support (see [`AcpServer::client_supports_terminal`]).
+/// Shell commands run with safety-heuristic checks disabled
+/// (`auto_approve = true`), matching `codewhale exec --auto`: ACP has no
+/// per-tool approval round-trip yet, so gating on the safety heuristic
+/// instead would just make some tool calls silently fail.
+fn build_acp_tool_registry(workspace: &std::path::Path, allow_shell: bool) -> ToolRegistry {
+    let mut context = ToolContext::new(workspace);
+    context.auto_approve = true;
+    context.shell_policy = if allow_shell {
+        ShellPolicy::Full
+    } else {
+        ShellPolicy::None
+    };
+
+    let mut builder = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_search_tools()
+        .with_git_tools()
+        .with_patch_tools();
+    if allow_shell {
+        builder = builder.with_shell_tools();
+    }
+
+    builder.build(context)
+}
+
+/// ACP `kind` hint for a tool call, used by the client to pick an icon/label.
+/// Falls back to `"other"` for tools without an obvious category.
+fn tool_call_kind(name: &str) -> &'static str {
+    match name {
+        "read_file" | "list_dir" | "grep_files" | "file_search" | "git_status" | "git_diff"
+        | "git_log" | "git_show" | "git_blame" => "read",
+        "write_file" | "edit_file" | "apply_patch" => "edit",
+        "exec_shell" => "execute",
+        _ => "other",
+    }
+}
+
+/// Human-readable title for a tool call: the tool name plus its primary
+/// argument (path/command/pattern) when present, so the client's tool-call
+/// card is legible without expanding raw input.
+fn tool_call_title(call: &PendingToolCall) -> String {
+    let detail = call
+        .input
+        .get("path")
+        .or_else(|| call.input.get("command"))
+        .or_else(|| call.input.get("pattern"))
+        .and_then(Value::as_str);
+    match detail {
+        Some(detail) => format!("{}: {}", call.name, detail),
+        None => call.name.clone(),
+    }
+}
+
+fn truncate_for_acp(content: &str) -> String {
+    if content.chars().count() <= TOOL_CALL_CONTENT_PREVIEW_CHARS {
+        return content.to_string();
+    }
+    let truncated: String = content
+        .chars()
+        .take(TOOL_CALL_CONTENT_PREVIEW_CHARS)
+        .collect();
+    format!("{truncated}\n… [truncated for display; the full result was sent to the model]")
+}
+
+async fn write_tool_call_start<W>(
+    writer: &mut W,
+    session_id: &str,
+    call: &PendingToolCall,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": {
+                "sessionUpdate": "tool_call",
+                "toolCallId": call.id,
+                "title": tool_call_title(call),
+                "kind": tool_call_kind(&call.name),
+                "status": "in_progress",
+                "rawInput": call.input,
+            }
+        }
+    });
+    write_json_line(writer, notification).await
+}
+
+async fn write_tool_call_update<W>(
+    writer: &mut W,
+    session_id: &str,
+    call: &PendingToolCall,
+    status: &str,
+    content: Option<&str>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut update = json!({
+        "sessionUpdate": "tool_call_update",
+        "toolCallId": call.id,
+        "status": status,
+    });
+    if let Some(content) = content {
+        update["content"] = json!([{
+            "type": "content",
+            "content": { "type": "text", "text": truncate_for_acp(content) }
+        }]);
+    }
+    let notification = json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": session_id,
+            "update": update
+        }
+    });
+    write_json_line(writer, notification).await
 }
 
 struct ScopedCurrentDir {
@@ -771,6 +1303,8 @@ fn jsonrpc_response_id(id: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
 
     #[test]
     fn initialize_advertises_baseline_acp_agent() {
@@ -1049,6 +1583,32 @@ mod tests {
         }
     }
 
+    /// Simulate one streamed `tool_use` content block at `index`: a start
+    /// event carrying the id/name, an `input_json_delta` with the full
+    /// arguments JSON, and the closing stop event — matching the real
+    /// provider's per-index streaming shape closely enough to exercise
+    /// [`drive_prompt_stream`]'s accumulator.
+    fn tool_use_events(index: u32, id: &str, name: &str, input_json: &str) -> Vec<StreamEvent> {
+        vec![
+            StreamEvent::ContentBlockStart {
+                index,
+                content_block: ContentBlockStart::ToolUse {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    input: json!({}),
+                    caller: None,
+                },
+            },
+            StreamEvent::ContentBlockDelta {
+                index,
+                delta: Delta::InputJsonDelta {
+                    partial_json: input_json.to_string(),
+                },
+            },
+            StreamEvent::ContentBlockStop { index },
+        ]
+    }
+
     /// A stream that yields the given events immediately, then ends.
     fn ready_stream(events: Vec<StreamEvent>) -> StreamEventBox {
         Box::pin(futures_util::stream::iter(
@@ -1092,12 +1652,13 @@ mod tests {
         let mut reader = lines_from("");
         let mut out = Vec::new();
 
-        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+        let (outcome, tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
             .await
             .expect("driver ok");
 
         // Full text is accumulated for history...
         assert_eq!(outcome, PromptOutcome::Completed("hello world".to_string()));
+        assert!(tool_calls.is_empty());
         // ...and each delta was emitted as its own session/update chunk.
         let updates = parse_lines(out);
         assert_eq!(updates.len(), 2);
@@ -1115,11 +1676,12 @@ mod tests {
         );
         let mut out = Vec::new();
 
-        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+        let (outcome, tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
             .await
             .expect("driver ok");
 
         assert_eq!(outcome, PromptOutcome::Cancelled);
+        assert!(tool_calls.is_empty());
         // Notification-form cancel (no id) is acknowledged by acting, not writing.
         assert!(out.is_empty());
     }
@@ -1134,7 +1696,7 @@ mod tests {
         );
         let mut out = Vec::new();
 
-        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+        let (outcome, _tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
             .await
             .expect("driver ok");
 
@@ -1157,7 +1719,7 @@ mod tests {
             lines_from(r#"{"jsonrpc":"2.0","id":9,"method":"session/new","params":{}}"#);
         let mut out = Vec::new();
 
-        let outcome = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+        let (outcome, _tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
             .await
             .expect("driver ok");
 
@@ -1169,6 +1731,65 @@ mod tests {
                 .any(|v| v["id"] == "9" && v["error"]["code"] == -32603),
             "expected a prompt-in-progress error for the concurrent request, got {lines:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_assembles_a_single_streamed_tool_call() {
+        let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"src/lib.rs"}"#);
+        events.push(StreamEvent::MessageStop);
+        let stream = ready_stream(events);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let (outcome, tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        assert_eq!(outcome, PromptOutcome::Completed(String::new()));
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[0].name, "read_file");
+        assert_eq!(tool_calls[0].input, json!({"path": "src/lib.rs"}));
+        assert!(tool_calls[0].parse_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_assembles_multiple_parallel_tool_calls_in_order() {
+        let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"a.rs"}"#);
+        events.extend(tool_use_events(
+            1,
+            "call_2",
+            "read_file",
+            r#"{"path":"b.rs"}"#,
+        ));
+        events.push(StreamEvent::MessageStop);
+        let stream = ready_stream(events);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let (_outcome, tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        assert_eq!(tool_calls.len(), 2);
+        assert_eq!(tool_calls[0].id, "call_1");
+        assert_eq!(tool_calls[1].id, "call_2");
+    }
+
+    #[tokio::test]
+    async fn drive_prompt_reports_malformed_tool_arguments_instead_of_dropping_the_call() {
+        let mut events = tool_use_events(0, "call_1", "read_file", "{not json");
+        events.push(StreamEvent::MessageStop);
+        let stream = ready_stream(events);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let (_outcome, tool_calls) = drive_prompt_stream(stream, "sess_1", &mut reader, &mut out)
+            .await
+            .expect("driver ok");
+
+        assert_eq!(tool_calls.len(), 1);
+        assert!(tool_calls[0].parse_error.is_some());
     }
 
     #[test]
@@ -1206,5 +1827,398 @@ mod tests {
         // Session 1 should have the message
         let session1 = server.sessions.get(&sid1).unwrap();
         assert_eq!(session1.messages.len(), 1);
+    }
+
+    #[test]
+    fn concurrent_sessions_each_get_their_own_tool_registry() {
+        let mut server = AcpServer::new(
+            Config::default(),
+            "test-model".to_string(),
+            PathBuf::from("/tmp"),
+        );
+        let s1 = server.new_session(json!({ "cwd": "/tmp" })).unwrap();
+        let s2 = server.new_session(json!({ "cwd": "/tmp" })).unwrap();
+        let id1 = s1["sessionId"].as_str().unwrap();
+        let id2 = s2["sessionId"].as_str().unwrap();
+
+        let reg1 = server.session_tool_registry(id1).expect("registry 1");
+        let reg2 = server.session_tool_registry(id2).expect("registry 2");
+        assert!(!Arc::ptr_eq(&reg1, &reg2));
+        // Both sessions expose the same reusable tool surface: read/write
+        // file tools, search, git, patch, and shell.
+        assert!(reg1.contains("read_file"));
+        assert!(reg1.contains("write_file"));
+        assert!(reg1.contains("list_dir"));
+        assert!(reg1.contains("apply_patch"));
+        assert!(reg1.contains("exec_shell"));
+    }
+
+    #[test]
+    fn shell_tool_omitted_when_client_declares_no_terminal_support() {
+        let workspace = std::env::temp_dir();
+        let registry = build_acp_tool_registry(&workspace, false);
+        assert!(!registry.contains("exec_shell"));
+        assert!(registry.contains("read_file"));
+    }
+
+    fn workspace_registry() -> (tempfile::TempDir, ToolRegistry) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let registry = build_acp_tool_registry(dir.path(), true);
+        (dir, registry)
+    }
+
+    #[tokio::test]
+    async fn tool_registry_read_file_returns_real_contents() {
+        let (dir, registry) = workspace_registry();
+        std::fs::write(dir.path().join("hello.txt"), "hi there").unwrap();
+
+        let result = registry
+            .execute_full("read_file", json!({"path": "hello.txt"}))
+            .await
+            .expect("read_file succeeds");
+
+        assert!(result.success);
+        assert!(result.content.contains("hi there"));
+    }
+
+    #[tokio::test]
+    async fn tool_registry_write_file_creates_a_real_file() {
+        let (dir, registry) = workspace_registry();
+
+        let result = registry
+            .execute_full(
+                "write_file",
+                json!({"path": "created.txt", "content": "new content"}),
+            )
+            .await
+            .expect("write_file succeeds");
+
+        assert!(result.success);
+        let on_disk = std::fs::read_to_string(dir.path().join("created.txt")).unwrap();
+        assert_eq!(on_disk, "new content");
+    }
+
+    #[tokio::test]
+    async fn tool_registry_list_dir_reports_real_directory_contents() {
+        let (dir, registry) = workspace_registry();
+        std::fs::write(dir.path().join("a.txt"), "a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "b").unwrap();
+
+        let result = registry
+            .execute_full("list_dir", json!({"path": "."}))
+            .await
+            .expect("list_dir succeeds");
+
+        assert!(result.success);
+        assert!(result.content.contains("a.txt"));
+        assert!(result.content.contains("b.txt"));
+    }
+
+    #[tokio::test]
+    async fn tool_registry_exec_shell_runs_a_real_command() {
+        let (_dir, registry) = workspace_registry();
+
+        let result = registry
+            .execute_full("exec_shell", json!({"command": "echo acp-terminal-check"}))
+            .await
+            .expect("exec_shell succeeds");
+
+        assert!(result.content.contains("acp-terminal-check"));
+    }
+
+    #[tokio::test]
+    async fn tool_registry_read_file_reports_failure_for_missing_path() {
+        let (_dir, registry) = workspace_registry();
+
+        let err = registry
+            .execute_full("read_file", json!({"path": "does-not-exist.txt"}))
+            .await
+            .expect_err("missing file is a tool error");
+
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// Feeds [`run_agentic_prompt_turn`] a fixed sequence of canned per-round
+    /// streams (no real provider), so the multi-round tool loop — including
+    /// nested tool calls across several rounds — is exercised end-to-end
+    /// against the real file-tool registry. A plain struct + inherent async
+    /// method (rather than a boxed closure) lets each test's `|msgs| scripted.next()`
+    /// closure return the async method's own anonymous future type directly,
+    /// so `Fut` is inferred without needing a `dyn Future` trait object.
+    struct ScriptedStreams(RefCell<VecDeque<StreamEventBox>>);
+
+    impl ScriptedStreams {
+        fn new(streams: Vec<StreamEventBox>) -> Self {
+            Self(RefCell::new(VecDeque::from(streams)))
+        }
+
+        async fn next(&self) -> Result<StreamEventBox> {
+            Ok(self
+                .0
+                .borrow_mut()
+                .pop_front()
+                .expect("test provided enough scripted rounds"))
+        }
+    }
+
+    #[tokio::test]
+    async fn agentic_turn_executes_a_tool_call_then_streams_the_final_answer() {
+        let (dir, registry) = workspace_registry();
+        std::fs::write(dir.path().join("VERSION"), "9.9.9").unwrap();
+
+        let round1 = ready_stream({
+            let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"VERSION"}"#);
+            events.push(StreamEvent::MessageStop);
+            events
+        });
+        let round2 = ready_stream(vec![
+            text_delta("The version is 9.9.9"),
+            StreamEvent::MessageStop,
+        ]);
+
+        let scripted = ScriptedStreams::new(vec![round1, round2]);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let (outcome, messages) = run_agentic_prompt_turn(
+            "sess_1",
+            vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "What version is this?".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            &registry,
+            &mut reader,
+            &mut out,
+            |_msgs| scripted.next(),
+        )
+        .await
+        .expect("turn completes");
+
+        assert_eq!(
+            outcome,
+            PromptOutcome::Completed("The version is 9.9.9".to_string())
+        );
+        // user -> assistant(tool_use) -> user(tool_result) -> assistant(text)
+        assert_eq!(messages.len(), 4);
+        assert!(matches!(
+            messages[1].content[0],
+            ContentBlock::ToolUse { .. }
+        ));
+        let ContentBlock::ToolResult {
+            content, is_error, ..
+        } = &messages[2].content[0]
+        else {
+            panic!("expected a tool_result message");
+        };
+        assert!(content.contains("9.9.9"));
+        assert_eq!(*is_error, Some(false));
+
+        // The client saw a tool_call start, a completed update, and the
+        // streamed final-answer chunk.
+        let lines = parse_lines(out);
+        assert!(
+            lines
+                .iter()
+                .any(|v| v["params"]["update"]["sessionUpdate"] == "tool_call")
+        );
+        assert!(lines.iter().any(
+            |v| v["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                && v["params"]["update"]["status"] == "completed"
+        ));
+        assert!(lines.iter().any(|v| v["params"]["update"]["sessionUpdate"]
+            == "agent_message_chunk"
+            && v["params"]["update"]["content"]["text"] == "The version is 9.9.9"));
+    }
+
+    #[tokio::test]
+    async fn agentic_turn_chains_nested_tool_calls_across_rounds() {
+        let (dir, registry) = workspace_registry();
+        std::fs::write(dir.path().join("a.txt"), "contents-of-a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "contents-of-b").unwrap();
+
+        let round1 = ready_stream({
+            let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"a.txt"}"#);
+            events.push(StreamEvent::MessageStop);
+            events
+        });
+        // After seeing a.txt's contents, the model asks for b.txt too.
+        let round2 = ready_stream({
+            let mut events = tool_use_events(0, "call_2", "read_file", r#"{"path":"b.txt"}"#);
+            events.push(StreamEvent::MessageStop);
+            events
+        });
+        let round3 = ready_stream(vec![
+            text_delta("Both files read"),
+            StreamEvent::MessageStop,
+        ]);
+
+        let scripted = ScriptedStreams::new(vec![round1, round2, round3]);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let (outcome, messages) = run_agentic_prompt_turn(
+            "sess_1",
+            vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "Read both files".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            &registry,
+            &mut reader,
+            &mut out,
+            |_msgs| scripted.next(),
+        )
+        .await
+        .expect("turn completes");
+
+        assert_eq!(
+            outcome,
+            PromptOutcome::Completed("Both files read".to_string())
+        );
+        // user, assistant(tool_use a), user(result a), assistant(tool_use b),
+        // user(result b), assistant(text)
+        assert_eq!(messages.len(), 6);
+        let ContentBlock::ToolResult {
+            content: a_content, ..
+        } = &messages[2].content[0]
+        else {
+            panic!("expected tool_result for a.txt");
+        };
+        assert!(a_content.contains("contents-of-a"));
+        let ContentBlock::ToolResult {
+            content: b_content, ..
+        } = &messages[4].content[0]
+        else {
+            panic!("expected tool_result for b.txt");
+        };
+        assert!(b_content.contains("contents-of-b"));
+    }
+
+    #[tokio::test]
+    async fn agentic_turn_reports_a_tool_failure_back_to_the_model_and_keeps_going() {
+        let (_dir, registry) = workspace_registry();
+
+        let round1 = ready_stream({
+            let mut events = tool_use_events(0, "call_1", "read_file", r#"{"path":"missing.txt"}"#);
+            events.push(StreamEvent::MessageStop);
+            events
+        });
+        let round2 = ready_stream(vec![
+            text_delta("That file does not exist"),
+            StreamEvent::MessageStop,
+        ]);
+
+        let scripted = ScriptedStreams::new(vec![round1, round2]);
+        let mut reader = lines_from("");
+        let mut out = Vec::new();
+
+        let (outcome, messages) = run_agentic_prompt_turn(
+            "sess_1",
+            vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "Read missing.txt".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            &registry,
+            &mut reader,
+            &mut out,
+            |_msgs| scripted.next(),
+        )
+        .await
+        .expect("turn completes even though the tool failed");
+
+        assert_eq!(
+            outcome,
+            PromptOutcome::Completed("That file does not exist".to_string())
+        );
+        let ContentBlock::ToolResult { is_error, .. } = &messages[2].content[0] else {
+            panic!("expected a tool_result message");
+        };
+        assert_eq!(*is_error, Some(true));
+
+        let lines = parse_lines(out);
+        assert!(lines.iter().any(
+            |v| v["params"]["update"]["sessionUpdate"] == "tool_call_update"
+                && v["params"]["update"]["status"] == "failed"
+        ));
+    }
+
+    #[cfg(windows)]
+    const SLOW_SHELL_COMMAND: &str = "ping -n 6 127.0.0.1 >NUL";
+    #[cfg(not(windows))]
+    const SLOW_SHELL_COMMAND: &str = "sleep 5";
+
+    #[tokio::test]
+    async fn agentic_turn_cancels_while_a_tool_is_running() {
+        let (_dir, registry) = workspace_registry();
+
+        // exec_shell runs long enough for the cancel line to win the race.
+        let round1 = ready_stream({
+            let mut events = tool_use_events(
+                0,
+                "call_1",
+                "exec_shell",
+                &json!({ "command": SLOW_SHELL_COMMAND }).to_string(),
+            );
+            events.push(StreamEvent::MessageStop);
+            events
+        });
+        let scripted = ScriptedStreams::new(vec![round1]);
+        let mut reader = lines_from(
+            r#"{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"sess_1"}}"#,
+        );
+        let mut out = Vec::new();
+
+        let (outcome, _messages) = run_agentic_prompt_turn(
+            "sess_1",
+            vec![Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::Text {
+                    text: "Run a slow command".to_string(),
+                    cache_control: None,
+                }],
+            }],
+            &registry,
+            &mut reader,
+            &mut out,
+            |_msgs| scripted.next(),
+        )
+        .await
+        .expect("turn resolves even when cancelled mid-tool");
+
+        assert_eq!(outcome, PromptOutcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn concurrent_acp_sessions_execute_tools_independently() {
+        let (dir1, registry1) = workspace_registry();
+        let (dir2, registry2) = workspace_registry();
+        std::fs::write(dir1.path().join("f.txt"), "session-one").unwrap();
+        std::fs::write(dir2.path().join("f.txt"), "session-two").unwrap();
+
+        let (result1, result2) = tokio::join!(
+            registry1.execute_full("read_file", json!({"path": "f.txt"})),
+            registry2.execute_full("read_file", json!({"path": "f.txt"})),
+        );
+
+        assert!(
+            result1
+                .expect("session 1 read")
+                .content
+                .contains("session-one")
+        );
+        assert!(
+            result2
+                .expect("session 2 read")
+                .content
+                .contains("session-two")
+        );
     }
 }
