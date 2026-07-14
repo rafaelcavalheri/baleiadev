@@ -1,25 +1,31 @@
-<#
+﻿<#
 .SYNOPSIS
     Builds CodeWhale binaries with progress reporting.
 
 .DESCRIPTION
-    Compiles all default workspace members (codewhale-cli, codewhale-tui,
-    codewhale-app-server) in release mode and shows live cargo output
+    Compiles all workspace binaries (codew, codewhale, codewhale-tui)
+    in release mode and shows live cargo output
     with a PowerShell progress bar.
 
 .PARAMETER Debug
     Build in debug mode instead of release.
 
 .PARAMETER Bin
-    Build only a specific binary (e.g. "codewhale", "codewhale-tui", "codewhale-app-server").
+    Build only a specific binary (e.g. "codew", "codewhale", "codewhale-tui").
     If omitted, builds all three.
 
 .PARAMETER Clean
     Run `cargo clean` before building.
 
+.PARAMETER Fast
+    Faster release build: thin LTO and 16 codegen units instead of the
+    manifest's fat LTO + 1 codegen unit. Cuts build time roughly 2-4x at a
+    small binary size/perf cost. Ignored with -Debug.
+
 .EXAMPLE
     .\scripts\build.ps1
     .\scripts\build.ps1 -Debug
+    .\scripts\build.ps1 -Fast
     .\scripts\build.ps1 -Bin codewhale-tui
     .\scripts\build.ps1 -Clean
 #>
@@ -27,7 +33,8 @@
 param(
     [switch]$Debug,
     [string]$Bin,
-    [switch]$Clean
+    [switch]$Clean,
+    [switch]$Fast
 )
 
 $ErrorActionPreference = "Stop"
@@ -56,13 +63,20 @@ try {
     $ProfileName = if ($Debug) { "debug" } else { "release" }
     $TargetDir = "target/$ProfileName"
 
+    if ($Fast -and -not $Debug) {
+        # Override the manifest's fat LTO + codegen-units=1 for this build only.
+        $env:CARGO_PROFILE_RELEASE_LTO = "thin"
+        $env:CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16"
+        Write-Host "       Fast mode: thin LTO, 16 codegen units" -ForegroundColor DarkYellow
+    }
+
     Write-Host "`n[$(if ($Clean) { '2' } else { '1' })/3] Building in $ProfileName mode..." -ForegroundColor Yellow
 
     # ── Build ─────────────────────────────────────────
     $Binaries = if ($Bin) {
         @($Bin)
     } else {
-        @("codewhale", "codewhale-tui", "codewhale-app-server")
+        @("codew", "codewhale", "codewhale-tui")
     }
 
     $BuildArgs = @(
@@ -133,7 +147,9 @@ try {
     # ── Verify binaries ───────────────────────────────
     Write-Host "`n[$(if ($Clean) { '3' } else { '2' })/3] Verifying binaries..." -ForegroundColor Yellow
 
-    $ext = if ($IsWindows) { ".exe" } else { "" }
+    # $IsWindows only exists in PowerShell Core; Windows PowerShell 5.1 is
+    # always Windows, so treat a missing variable as Windows too.
+    $ext = if ($IsWindows -or $PSVersionTable.PSEdition -ne 'Core') { ".exe" } else { "" }
     $Found = @()
     $Missing = @()
 
