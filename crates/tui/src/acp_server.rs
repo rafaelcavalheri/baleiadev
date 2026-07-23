@@ -37,6 +37,7 @@ use crate::client::DeepSeekClient;
 use crate::config::{ApiProvider, Config};
 use crate::llm_client::{LlmClient, StreamEventBox};
 use crate::models::{ContentBlock, ContentBlockStart, Delta, Message, MessageRequest, StreamEvent};
+use crate::session_manager::SessionManager;
 use crate::tools::{ToolContext, ToolRegistry, ToolRegistryBuilder};
 use crate::worker_profile::ShellPolicy;
 
@@ -722,6 +723,8 @@ struct AcpServer {
     /// without shell, which is safe; the client can re-declare support on
     /// reconnect or via `session/request_permission`.
     client_supports_terminal: bool,
+    /// Persisted session manager for loading saved sessions via `session/load`.
+    session_manager: Option<SessionManager>,
 }
 
 struct AcpSession {
@@ -755,6 +758,7 @@ struct AcpError {
 
 impl AcpServer {
     fn new(config: Config, model: String, default_cwd: PathBuf) -> Self {
+        let session_manager = SessionManager::default_location().ok();
         Self {
             config,
             model,
@@ -762,6 +766,7 @@ impl AcpServer {
             sessions: HashMap::new(),
             insertion_order: VecDeque::new(),
             client_supports_terminal: false,
+            session_manager,
         }
     }
 
@@ -792,6 +797,7 @@ impl AcpServer {
             // A cancel that arrives with no prompt in flight is an idempotent
             // no-op (the in-flight case is handled by the prompt driver).
             "session/cancel" => Ok(AcpDispatch::Response(json!(null))),
+            "session/load" => Ok(AcpDispatch::Response(self.load_session(params)?)),
             "shutdown" => Ok(AcpDispatch::Shutdown),
             _ => Err(AcpError::method_not_found(method)),
         }
@@ -909,6 +915,51 @@ impl AcpServer {
 
         self.model = model;
         Ok(self.current_model())
+    }
+
+    /// Load a saved session from disk into memory so the client can resume it.
+    fn load_session(&mut self, params: Value) -> std::result::Result<Value, AcpError> {
+        let session_id = params
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| AcpError::invalid_params("sessionId is required"))?
+            .to_string();
+
+        let sm = self
+            .session_manager
+            .as_ref()
+            .ok_or_else(|| AcpError::internal("session manager unavailable"))?;
+
+        let saved = sm
+            .load_session(&session_id)
+            .map_err(|e| AcpError::internal(format!("could not load session: {e}")))?;
+
+        let cwd = if saved.metadata.workspace.is_absolute() {
+            saved.metadata.workspace.clone()
+        } else {
+            self.default_cwd.clone()
+        };
+        let tool_registry = Arc::new(build_acp_tool_registry(&cwd, self.client_supports_terminal));
+
+        // Evict oldest session when at capacity.
+        if self.sessions.len() >= MAX_ACP_SESSIONS {
+            if let Some(oldest) = self.insertion_order.pop_front() {
+                self.sessions.remove(&oldest);
+            }
+        }
+
+        self.insertion_order
+            .push_back(session_id.clone());
+        self.sessions.insert(
+            session_id.clone(),
+            AcpSession {
+                cwd,
+                messages: saved.messages,
+                tool_registry,
+            },
+        );
+
+        Ok(json!({ "sessionId": session_id }))
     }
 
     /// Validate a `session/prompt` request and append the user turn to history,
@@ -1233,6 +1284,13 @@ impl AcpError {
             message: format!("method not found: {method}"),
         }
     }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            code: -32603,
+            message: message.into(),
+        }
+    }
 }
 
 fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> Value {
@@ -1241,7 +1299,7 @@ fn initialize_result(client_protocol_version: Option<u64>, config: &Config) -> V
             .map(|version| version.min(ACP_PROTOCOL_VERSION))
             .unwrap_or(ACP_PROTOCOL_VERSION),
         "agentCapabilities": {
-            "loadSession": false,
+            "loadSession": true,
             "modelSelection": true,
             "promptCapabilities": {
                 "image": false,
@@ -1411,7 +1469,7 @@ mod tests {
 
         assert_eq!(result["protocolVersion"], 1);
         assert_eq!(result["agentInfo"]["name"], "codewhale");
-        assert_eq!(result["agentCapabilities"]["loadSession"], false);
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
         assert_eq!(
             result["agentCapabilities"]["promptCapabilities"]["embeddedContext"],
             true

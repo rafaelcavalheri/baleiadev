@@ -1,5 +1,13 @@
 # Repository Agent Guidance
 
+## RTK command policy
+
+- Always prefix shell commands with `rtk` when running commands from this
+  repository.
+- Use `rtk proxy powershell -NoProfile -Command "<cmd>"` for PowerShell cmdlets.
+- If `rtk` is not installed or not on `PATH`, fall back to the raw command and
+  mention that RTK was unavailable.
+
 ## Where to work right now (read this first)
 
 - **Repo:** `Hmbown/CodeWhale`. This repo lives on multiple devices, so work in
